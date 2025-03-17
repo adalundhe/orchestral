@@ -8,9 +8,9 @@
 
 
 | Package     | orchestral                                                          |
-| ----------- | -----------                                                     |
-| Version     | 0.1.9                                                           |
+| ----------- | -----------                                                         |
+| Version     | 0.1.0                                                               |
 | Download    | https://pypi.org/project/orchestral/                                | 
 | Source      | https://github.com/adalundhe/orchestral                             |
-| Keywords    | performance, testing, async, distributed, graph, DAG, workflow  |
+| Keywords    | async, tasks, runner, graph, workflow, shell, jobs                  |
 
