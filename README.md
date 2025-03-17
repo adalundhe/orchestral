@@ -12,5 +12,5 @@
 | Version     | 0.1.0                                                               |
 | Download    | https://pypi.org/project/orchestral/                                | 
 | Source      | https://github.com/adalundhe/orchestral                             |
-| Keywords    | async, tasks, runner, graph, workflow, shell, jobs                  |
+| Keywords    | async, tasks, runner, graph, shell, jobs                            |
 
