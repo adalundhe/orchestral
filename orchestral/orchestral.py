@@ -1,12 +1,16 @@
 import asyncio
+import time
+import traceback
 from collections import defaultdict
 from typing import Dict, List
 
 from taskex import Env
 from taskex.run import Run
+from taskex.util import TimeParser
 
 from .step_type import StepType
 from .workflow import Workflow
+from .workflow_status import WorkflowStatus
 
 
 class Orchestral:
@@ -23,6 +27,10 @@ class Orchestral:
         self._execute_next = False
 
         self.results: dict[str, dict[int, Run]] = defaultdict(dict)
+        self.error: Exception | None = None
+        self.trace: str | None = None
+        self._start: float | int = 0
+        self.elapsed: float = 0
 
     def __enter__(self):
         self._workflow = Workflow()
@@ -30,6 +38,11 @@ class Orchestral:
 
     def __exit__(self, type, value, traceback):
         pass
+
+    @property
+    def status(self):
+        if self._workflow:
+            return self._workflow.status
 
     async def __aiter__(self):
         # Before we yield results wait
@@ -47,17 +60,51 @@ class Orchestral:
     async def run(
         self,
         wait: bool = False,
+        timeout: str | int | float | None = None,
     ):
-        if wait:
-            await self._run_workflow()
+        if isinstance(timeout, str):
+            timeout = TimeParser(timeout).time
 
-        else:
-            self._run_task = asyncio.create_task(
-                self._run_workflow(),
+        try:
+            self._start = time.monotonic()
+
+            if wait and timeout:
+                await asyncio.wait_for(self._run_workflow(), timeout=timeout)
+
+            elif wait:
+                await self._run_workflow()
+
+            elif timeout:
+                self._run_task = asyncio.create_task(
+                    asyncio.wait_for(
+                        self._run_workflow(),
+                        timeout=timeout,
+                    ),
+                )
+
+            else:
+                self._run_task = asyncio.create_task(
+                    self._run_workflow(),
+                )
+
+        except asyncio.TimeoutError:
+            self.elapsed = time.monotonic() - self._start
+            self.trace = traceback.format_exc()
+            self.error = Exception(
+                f"Err. - Workflow exceeded timeout of {timeout} seconds"
             )
+
+        except Exception as err:
+            self.elapsed = time.monotonic() - self._start
+            self.trace = traceback.format_exc()
+            self.error = err
+
+            self._workflow.status = WorkflowStatus.FAILED
 
     async def _run_workflow(self):
         self._execute_next = True
+        self._workflow.status = WorkflowStatus.READY
+
         for group in self._workflow:
             self._batch_results.clear()
 
@@ -106,6 +153,9 @@ class Orchestral:
 
             if self._execute_next is False:
                 break
+
+        self.elapsed = time.monotonic() - self._start
+        self._workflow.status = WorkflowStatus.COMPLETED
 
     async def stop(self):
         self._execute_next = False

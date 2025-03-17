@@ -17,6 +17,7 @@ async def run():
     await orch.run(wait=True)
 
     print(orch.results, "DONE!")
+    print(orch.error)
 
     await orch.shutdown()
 
