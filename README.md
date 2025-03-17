@@ -9,7 +9,7 @@
 
 | Package     | orchestral                                                          |
 | ----------- | -----------                                                         |
-| Version     | 0.1.0                                                               |
+| Version     | 0.1.1                                                               |
 | Download    | https://pypi.org/project/orchestral/                                | 
 | Source      | https://github.com/adalundhe/orchestral                             |
 | Keywords    | async, tasks, runner, graph, shell, jobs                            |
