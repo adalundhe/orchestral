@@ -6,7 +6,7 @@ pydantic==2.10.6
     # via taskex
 pydantic-core==2.27.2
     # via pydantic
-taskex==0.2.10
+taskex==0.2.11
     # via -r requirements.in
 typing-extensions==4.12.2
     # via

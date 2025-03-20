@@ -7,7 +7,7 @@ from typing import Dict, List
 from taskex import Env
 from taskex.run import Run
 from taskex.util import TimeParser
-
+from .error import OrchestralTaskFailure
 from .step_type import StepType
 from .workflow import Workflow
 from .workflow_status import WorkflowStatus
@@ -60,6 +60,7 @@ class Orchestral:
     async def run(
         self,
         wait: bool = False,
+        fail_fast: bool = False,
         timeout: str | int | float | None = None,
     ):
         if isinstance(timeout, str):
@@ -69,10 +70,14 @@ class Orchestral:
             self._start = time.monotonic()
 
             if wait and timeout:
-                await asyncio.wait_for(self._run_workflow(), timeout=timeout)
+                await asyncio.wait_for(self._run_workflow(
+                    fail_fast=fail_fast,
+                ), timeout=timeout)
 
             elif wait:
-                await self._run_workflow()
+                await self._run_workflow(
+                    fail_fast=fail_fast,
+                )
 
             elif timeout:
                 self._run_task = asyncio.create_task(
@@ -101,7 +106,10 @@ class Orchestral:
 
             self._workflow.status = WorkflowStatus.FAILED
 
-    async def _run_workflow(self):
+    async def _run_workflow(
+        self,
+        fail_fast: bool = True,
+    ):
         self._execute_next = True
         self._workflow.status = WorkflowStatus.READY
 
@@ -142,6 +150,11 @@ class Orchestral:
             group_results = await self._workflow.runner.wait_all(
                 [run.token for run in group_runs],
             )
+
+            if fail_fast:
+                for res in group_results:
+                    if res.error:
+                        return OrchestralTaskFailure(res.error, res.trace)
 
             self._batch_results.extend(group_results)
 
