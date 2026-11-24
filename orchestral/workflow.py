@@ -1,11 +1,11 @@
-from typing import Dict, List, TypeVar
+from typing import Iterator
 
-from taskex import Env, TaskRunner
+from taskex import Env
+from taskex.snowflake import SnowflakeGenerator
 
 from .group import Group
+from .runner import WorkflowRunner
 from .workflow_status import WorkflowStatus
-
-T = TypeVar("T")
 
 
 class Workflow:
@@ -13,16 +13,33 @@ class Workflow:
         self,
         config: Env | None = None,
     ) -> None:
+        self._config = config
         self._groups: list[Group] = []
-        self._execution_orders: Dict[str, List[List[str]]] = {}
-        self.runner = TaskRunner(config=config)
+        self._snowflake_generator = SnowflakeGenerator(0)
+        self._runner: WorkflowRunner | None = None
         self.status = WorkflowStatus.READY
 
-    def __iter__(self):
-        for group in self._groups:
-            yield group
+    @property
+    def runner(self) -> WorkflowRunner:
+        if self._runner is None:
+            self._runner = WorkflowRunner(config=self._config)
+        return self._runner
 
-    def group(self):
-        group = Group(self.runner._snowflake_generator.generate())
+    @property
+    def has_runner(self) -> bool:
+        return self._runner is not None
+
+    @property
+    def groups(self) -> list[Group]:
+        return list(self._groups)
+
+    def __iter__(self) -> Iterator[Group]:
+        yield from self._groups
+
+    def __len__(self) -> int:
+        return len(self._groups)
+
+    def group(self) -> Group:
+        group = Group(self._snowflake_generator.generate())
         self._groups.append(group)
         return group

@@ -2,13 +2,14 @@ import asyncio
 import time
 import traceback
 from collections import defaultdict
-from typing import Dict, List
+from typing import AsyncIterator
 
 from taskex import Env
-from taskex.run import Run
-from taskex.util import TimeParser
+from taskex.models import RunStatus
+
 from .error import OrchestralTaskFailure
-from .step_type import StepType
+from .runner import RunHandle, StepResult
+from .util import parse_duration
 from .workflow import Workflow
 from .workflow_status import WorkflowStatus
 
@@ -18,43 +19,90 @@ class Orchestral:
         self,
         config: Env | None = None,
     ) -> None:
+        self._config = config
         self._workflow = Workflow(config=config)
 
-        self._execution_orders: Dict[str, List[List[str]]] = {}
-        self._batch_results: list[Run] = []
-        self._results_waiter = asyncio.Event()
-        self._run_task: asyncio.Task | None = None
+        self._batches: list[list[StepResult]] = []
+        self._batch_waiter = asyncio.Event()
+        self._done = False
+        self._run_task: asyncio.Task[None] | None = None
+        self._run_generation = 0
         self._execute_next = False
+        self._stop_requested = False
 
-        self.results: dict[str, dict[int, Run]] = defaultdict(dict)
+        self.results: dict[str, dict[int, StepResult]] = defaultdict(dict)
         self.error: Exception | None = None
         self.trace: str | None = None
-        self._start: float | int = 0
-        self.elapsed: float = 0
+        self._start: float = 0.0
+        self.elapsed: float = 0.0
 
-    def __enter__(self):
-        self._workflow = Workflow()
-        return self._workflow
+    def __enter__(self) -> Workflow:
+        return self.create()
 
-    def __exit__(self, type, value, traceback):
-        pass
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        return None
+
+    async def __aenter__(self) -> "Orchestral":
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self.shutdown()
 
     @property
-    def status(self):
-        if self._workflow:
-            return self._workflow.status
+    def status(self) -> WorkflowStatus:
+        return self._workflow.status
 
-    async def __aiter__(self):
-        # Before we yield results wait
-        if self._results_waiter.is_set() is False:
-            await self._results_waiter.wait()
+    @property
+    def workflow(self) -> Workflow:
+        return self._workflow
 
-        results = list(self._batch_results)
+    @property
+    def is_running(self) -> bool:
+        return self._run_task is not None and not self._run_task.done()
 
-        yield results
+    def _notify_waiters(self) -> None:
+        waiter = self._batch_waiter
+        self._batch_waiter = asyncio.Event()
+        waiter.set()
 
-    def create(self):
-        self._workflow = Workflow()
+    def _reset_run_state(self) -> None:
+        self._run_generation += 1
+        self.results = defaultdict(dict)
+        self.error = None
+        self.trace = None
+        self._start = 0.0
+        self.elapsed = 0.0
+        self._batches = []
+        self._done = False
+        self._execute_next = False
+        self._stop_requested = False
+        self._notify_waiters()
+
+    async def __aiter__(self) -> AsyncIterator[list[StepResult]]:
+        idx = 0
+        while True:
+            while idx < len(self._batches):
+                yield list(self._batches[idx])
+                idx += 1
+
+            if self._done:
+                break
+
+            waiter = self._batch_waiter
+            await waiter.wait()
+
+    def create(self) -> Workflow:
+        if self.is_running:
+            raise RuntimeError(
+                "Cannot create a new workflow while a workflow is currently running"
+            )
+
+        if self._workflow.has_runner:
+            self._workflow.runner.abort()
+
+        self._run_task = None
+        self._reset_run_state()
+        self._workflow = Workflow(config=self._config)
         return self._workflow
 
     async def run(
@@ -62,142 +110,229 @@ class Orchestral:
         wait: bool = False,
         fail_fast: bool = False,
         timeout: str | int | float | None = None,
-    ):
-        if isinstance(timeout, str):
-            timeout = TimeParser(timeout).time
+    ) -> None:
+        if self.is_running:
+            raise RuntimeError("Workflow is already running")
 
+        timeout_seconds = parse_duration(timeout, name="timeout")
+
+        self._reset_run_state()
+        generation = self._run_generation
+        workflow = self._workflow
+        self._start = time.monotonic()
+        self._execute_next = True
+        workflow.status = WorkflowStatus.RUNNING
+
+        task = asyncio.create_task(
+            self._execute_workflow(
+                generation=generation,
+                workflow=workflow,
+                fail_fast=fail_fast,
+                timeout=timeout_seconds,
+            )
+        )
+        self._run_task = task
+
+        if wait:
+            await self._await_run_task(task)
+
+    async def wait(self) -> None:
+        """Wait for an in-progress non-blocking workflow run to finish."""
+        task = self._run_task
+        if task is None:
+            return
+        await self._await_run_task(task)
+
+    async def _await_run_task(self, task: asyncio.Task[None]) -> None:
         try:
-            self._start = time.monotonic()
+            await task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if self._stop_requested and (current is None or current.cancelling() == 0):
+                return
 
-            if wait and timeout:
-                await asyncio.wait_for(self._run_workflow(
-                    fail_fast=fail_fast,
-                ), timeout=timeout)
+            if not task.done():
+                self._execute_next = False
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            raise
 
-            elif wait:
-                await self._run_workflow(
-                    fail_fast=fail_fast,
-                )
-
-            elif timeout:
-                self._run_task = asyncio.create_task(
-                    asyncio.wait_for(
-                        self._run_workflow(),
-                        timeout=timeout,
+    async def _execute_workflow(
+        self,
+        *,
+        generation: int,
+        workflow: Workflow,
+        fail_fast: bool = False,
+        timeout: float | None = None,
+    ) -> None:
+        try:
+            if timeout is not None:
+                await asyncio.wait_for(
+                    self._run_workflow(
+                        generation=generation,
+                        workflow=workflow,
+                        fail_fast=fail_fast,
                     ),
+                    timeout=timeout,
                 )
-
             else:
-                self._run_task = asyncio.create_task(
-                    self._run_workflow(),
+                await self._run_workflow(
+                    generation=generation,
+                    workflow=workflow,
+                    fail_fast=fail_fast,
                 )
 
         except asyncio.TimeoutError:
-            self.elapsed = time.monotonic() - self._start
-            self.trace = traceback.format_exc()
-            self.error = Exception(
-                f"Err. - Workflow exceeded timeout of {timeout} seconds"
-            )
+            if generation == self._run_generation:
+                self.elapsed = time.monotonic() - self._start
+                self.trace = traceback.format_exc()
+                self.error = TimeoutError(
+                    f"Err. - Workflow exceeded timeout of {timeout} seconds"
+                )
+                workflow.status = WorkflowStatus.FAILED
+
+        except asyncio.CancelledError:
+            if generation == self._run_generation:
+                self.elapsed = time.monotonic() - self._start
+                if workflow.status == WorkflowStatus.RUNNING:
+                    workflow.status = WorkflowStatus.CANCELLED
+            raise
+
+        except OrchestralTaskFailure as err:
+            if generation == self._run_generation:
+                self.elapsed = time.monotonic() - self._start
+                self.trace = err.trace or traceback.format_exc()
+                self.error = err
+                workflow.status = WorkflowStatus.FAILED
 
         except Exception as err:
-            self.elapsed = time.monotonic() - self._start
-            self.trace = traceback.format_exc()
-            self.error = err
+            if generation == self._run_generation:
+                self.elapsed = time.monotonic() - self._start
+                self.trace = traceback.format_exc()
+                self.error = err
+                workflow.status = WorkflowStatus.FAILED
 
-            self._workflow.status = WorkflowStatus.FAILED
+        finally:
+            if generation == self._run_generation:
+                self._done = True
+                self._notify_waiters()
 
     async def _run_workflow(
         self,
-        fail_fast: bool = True,
-    ):
-        self._execute_next = True
-        self._workflow.status = WorkflowStatus.READY
+        *,
+        generation: int,
+        workflow: Workflow,
+        fail_fast: bool = False,
+    ) -> None:
+        for group in workflow:
+            if not self._execute_next or generation != self._run_generation:
+                break
 
-        for group in self._workflow:
-            self._batch_results.clear()
+            steps = group.steps
+            if not steps:
+                continue
 
-            group_runs = [
-                self._workflow.runner.command(
-                    step.call,
-                    *step.shell_args,
-                    alias=step.alias,
-                    env=step.env,
-                    cwd=step.cwd,
-                    shell=step.shell,
-                    timeout=step.timeout,
-                    schedule=step.schedule,
-                    trigger=step.trigger,
-                    repeat=step.repeat,
-                    keep=step.keep,
-                    max_age=step.max_age,
-                    keep_policy=step.keep_policy,
-                )
-                if step.type == StepType.SHELL
-                else self._workflow.runner.run(
-                    step.call,
-                    alias=step.alias,
-                    timeout=step.timeout,
-                    schedule=step.schedule,
-                    trigger=step.trigger,
-                    repeat=step.repeat,
-                    keep=step.keep,
-                    max_age=step.max_age,
-                    keep_policy=step.keep_policy,
-                )
-                for step in group
-            ]
+            runner = workflow.runner
+            handles: list[RunHandle] = []
+            group_tokens: list[str] = []
+            try:
+                for step in steps:
+                    handle = runner.run_step(step)
+                    handles.append(handle)
+                    group_tokens.append(handle.token)
 
-            group_results = await self._workflow.runner.wait_all(
-                [run.token for run in group_runs],
-            )
+                if fail_fast:
+                    group_results, failed = await runner.wait_all_fail_fast(
+                        group_tokens
+                    )
+                else:
+                    group_results = await runner.wait_all(group_tokens)
+                    failed = None
+            except BaseException:
+                if group_tokens:
+                    await runner.cancel_many(group_tokens)
+                raise
 
-            if fail_fast:
-                for res in group_results:
-                    if res.error:
-                        return OrchestralTaskFailure(res.error, res.trace)
+            if generation != self._run_generation:
+                return
 
-            self._batch_results.extend(group_results)
-
+            self._batches.append(group_results)
             for res in group_results:
                 self.results[res.task_name][res.run_id] = res
 
-            if self._results_waiter.is_set() is False:
-                self._results_waiter.set()
+            for handle in handles:
+                for hist_res in handle.history:
+                    self.results[hist_res.task_name][hist_res.run_id] = hist_res
 
-            if self._execute_next is False:
+            self._notify_waiters()
+
+            if failed is not None:
+                raise OrchestralTaskFailure(
+                    failed.error or f"Task '{failed.task_name}' failed",
+                    failed.trace,
+                    task_name=failed.task_name,
+                    run_id=failed.run_id,
+                )
+
+            if not self._execute_next:
                 break
 
-        self.elapsed = time.monotonic() - self._start
-        self._workflow.status = WorkflowStatus.COMPLETED
+        if generation == self._run_generation:
+            self.elapsed = time.monotonic() - self._start
+            if not self._execute_next:
+                workflow.status = WorkflowStatus.CANCELLED
+            else:
+                workflow.status = WorkflowStatus.COMPLETED
 
-    async def stop(self):
+    async def stop(self) -> None:
         self._execute_next = False
-        await self._workflow.runner.stop()
+        self._stop_requested = True
 
-    async def shutdown(self):
+        if self._workflow.has_runner:
+            await self._workflow.runner.stop()
+
+        task = self._run_task
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._run_task = None
+
+        if self._workflow.status == WorkflowStatus.RUNNING:
+            self.elapsed = time.monotonic() - self._start
+            self._workflow.status = WorkflowStatus.CANCELLED
+
+        self._done = True
+        self._notify_waiters()
+
+    async def shutdown(self) -> None:
+        await self.stop()
+
+        if self._workflow.has_runner:
+            await self._workflow.runner.shutdown()
+
+    def abort(self) -> None:
+        self._run_generation += 1
         self._execute_next = False
-        await self._workflow.runner.shutdown()
+        self._stop_requested = True
 
-        if self._run_task:
-            await self._run_task
+        task = self._run_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._run_task = None
 
-        if self._results_waiter.is_set() is False:
-            self._results_waiter.set()
+        if self._workflow.has_runner:
+            self._workflow.runner.abort()
 
-    def abort(self):
-        self._execute_next = False
+        if self._workflow.status == WorkflowStatus.RUNNING:
+            self.elapsed = time.monotonic() - self._start
+            self._workflow.status = WorkflowStatus.CANCELLED
 
-        try:
-            self._run_task.cancel()
-
-        except (
-            asyncio.CancelledError,
-            asyncio.InvalidStateError,
-            asyncio.TimeoutError,
-        ):
-            pass
-
-        if self._results_waiter.is_set() is False:
-            self._results_waiter.set()
-
-        self._workflow.runner.abort()
+        self._done = True
+        self._notify_waiters()

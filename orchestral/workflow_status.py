@@ -1,7 +1,13 @@
 from enum import Enum
 from typing import Literal
 
-WorkflowStatusName = Literal["COMPLETED", "FAILED", "RUNNING", "READY"]
+WorkflowStatusName = Literal[
+    "COMPLETED",
+    "FAILED",
+    "RUNNING",
+    "READY",
+    "CANCELLED",
+]
 
 
 class WorkflowStatus(Enum):
@@ -9,3 +15,4 @@ class WorkflowStatus(Enum):
     FAILED = "FAILED"
     READY = "READY"
     RUNNING = "RUNNING"
+    CANCELLED = "CANCELLED"
