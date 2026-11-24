@@ -8,7 +8,7 @@ Orchestrate and execute shell commands, async coroutines, and sync Python functi
 
 | Package  | orchestral                                       |
 | -------- | ------------------------------------------------ |
-| Version  | 0.1.2                                            |
+| Version  | 0.2.0                                            |
 | Download | https://pypi.org/project/orchestral/             |
 | Source   | https://github.com/adalundhe/orchestral          |
 | Keywords | async, tasks, workflow, runner, graph, shell, jobs |
