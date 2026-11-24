@@ -1,25 +1,40 @@
 # API Reference
 
-All primary classes, functions, exceptions, and enums are exported from the top-level `orchestral` package:
+All primary classes, functions, exceptions, enums, and `taskex` checkpointing/pause helpers are exported from the top-level `orchestral` package:
 
 ```python
 from orchestral import (
+    Checkpoint,
+    CheckpointStore,
+    Env,
     ExecutionPlan,
     Group,
+    MemoryCheckpointStore,
     Orchestral,
     OrchestralCycleError,
     OrchestralError,
     OrchestralGraphError,
     OrchestralTaskFailure,
+    RunContext,
     RunHandle,
+    RunStatus,
+    SQLiteCheckpointStore,
+    ShellProcess,
     Step,
     StepResult,
     StepType,
+    TaskRun,
     Workflow,
     WorkflowRunner,
     WorkflowStatus,
     WorkflowStatusName,
     build_execution_plan,
+    checkpoint,
+    checkpoint_sync,
+    get_run_context,
+    last_checkpoint,
+    pause_point,
+    pause_point_sync,
 )
 ```
 
@@ -29,10 +44,15 @@ from orchestral import (
 
 ```python
 class Orchestral:
-    def __init__(self, config: Env | None = None) -> None
+    def __init__(
+        self,
+        config: Env | None = None,
+        checkpoint_store: CheckpointStore | None = None,
+        workflow_id: str | None = None,
+    ) -> None
 ```
 
-Main entry point for building, planning, running, streaming, and tearing down workflows.
+Main entry point for building, planning, running, pausing, resuming, checkpointing, streaming, and tearing down workflows.
 
 ### Attributes & Properties
 
@@ -40,42 +60,55 @@ Main entry point for building, planning, running, streaming, and tearing down wo
 - **`error: Exception | None`** — Workflow-level error (`OrchestralTaskFailure`, `TimeoutError`, or unexpected `Exception`), or `None` if no workflow-level error occurred.
 - **`trace: str | None`** — Formatted traceback associated with `error`, or `None`.
 - **`elapsed: float`** — Total workflow execution duration in seconds.
+- **`paused_duration -> float`** *(property)* — Cumulative seconds spent in `WorkflowStatus.PAUSED`.
 - **`status -> WorkflowStatus`** *(property)* — Current status of the active `Workflow`.
 - **`workflow -> Workflow`** *(property)* — The active `Workflow` instance.
-- **`is_running -> bool`** *(property)* — `True` while a workflow execution task is active.
+- **`workflow_id -> str`** *(property)* — Logical workflow identifier used for durable workflow checkpoints (defaults to `"default"`).
+- **`checkpoint_store -> CheckpointStore`** *(property)* — Active checkpoint store (`MemoryCheckpointStore`, `SQLiteCheckpointStore`, or user-supplied store).
+- **`is_running -> bool`** *(property)* — `True` while a workflow execution task is active (including when paused).
+- **`is_paused -> bool`** *(property)* — `True` when `status == WorkflowStatus.PAUSED`.
+- **`active_tokens -> list[str]`** *(property)* — Run tokens currently active in the in-flight wave.
 
 ### Context Managers & Iteration
 
-- **`with orch as workflow:` (`__enter__` / `__exit__`)** — Calls `create()` and returns a fresh `Workflow` configured with `config`. Does not shut down on exit so you can run the workflow immediately afterward.
-- **`async with Orchestral(config=...) as orch:` (`__aenter__` / `__aexit__`)** — Returns `self` and automatically calls `await self.shutdown()` on exit.
+- **`with orch as workflow:` (`__enter__` / `__exit__`)** — Calls `create()` and returns a fresh `Workflow` configured with `config` and `checkpoint_store`. Does not shut down on exit.
+- **`async with Orchestral(...) as orch:` (`__aenter__` / `__aexit__`)** — Returns `self` and automatically calls `await self.shutdown()` on exit.
 - **`async for batch in orch:` (`__aiter__`)** — Yields `list[ShellProcess | TaskRun]` for each completed wave in execution order and terminates when execution finishes or is stopped.
 
-### Methods
+### Execution, Pause & Resume Methods
 
 - **`create() -> Workflow`**
-  Creates and attaches a fresh `Workflow` using the configured `Env`, resetting run state and cleaning up any prior idle runner. Raises `RuntimeError` if a workflow is currently running.
+  Creates and attaches a fresh `Workflow` using `config` and `checkpoint_store`, resetting run state and cleaning up any prior idle runner. Raises `RuntimeError` if a workflow is currently running.
 
 - **`execution_order() -> list[list[str]]`**
-  Validates the active workflow's dependency graph and returns the wave-by-wave step names. Raises `OrchestralGraphError` / `OrchestralCycleError` if invalid.
+  Validates the active workflow's dependency graph and returns the wave-by-wave step names.
 
 - **`async run(wait: bool = False, fail_fast: bool = False, timeout: str | int | float | None = None) -> None`**
-  Validates the dependency graph and executes the active workflow wave by wave.
-  - `wait`: If `True`, awaits completion before returning. If `False`, runs in a background `asyncio.Task`.
-  - `fail_fast`: If `True`, cancels remaining siblings in the active wave and halts subsequent waves on the first `RunStatus.FAILED` step, setting `error = OrchestralTaskFailure(...)` and `status = WorkflowStatus.FAILED`.
-  - `timeout`: Optional workflow-wide deadline in seconds or duration string (`"500ms"`, `"10s"`, `"2m"`, etc.).
-  - Raises `RuntimeError` if already running; raises `ValueError`/`TypeError` on invalid `timeout`; raises `OrchestralGraphError`/`OrchestralCycleError` on invalid dependency graphs before launching any step.
+  Validates the dependency graph and executes the active workflow wave by wave from scratch.
+  - `timeout` is pause-aware: countdown freezes while `PAUSED`.
+  - Raises `RuntimeError` if already running; `ValueError`/`TypeError` on invalid `timeout`; `OrchestralGraphError`/`OrchestralCycleError` on invalid graphs before launching any step.
 
-- **`async wait() -> None`**
-  Awaits completion of an in-progress non-blocking (`wait=False`) run. Safe no-op if no run was started.
+- **`async pause() -> bool`**
+  Suspends a running workflow: transitions status to `WorkflowStatus.PAUSED`, freezes workflow timeout, pauses all active runs/schedules, prevents subsequent waves from launching, and saves a workflow checkpoint. Returns `True` if paused (or already paused), `False` otherwise.
 
-- **`async stop() -> None`**
-  Gracefully cancels active steps (terminating and reaping subprocesses), halts subsequent waves, marks a running workflow `WorkflowStatus.CANCELLED`, and unblocks `async for` consumers. Idempotent.
+- **`async resume(wait: bool = False, fail_fast: bool = False, timeout: str | int | float | None = None, *, rerun_completed: bool = False) -> None`**
+  - If currently `WorkflowStatus.PAUSED`: live-resumes all paused steps and continues executing remaining waves (awaiting completion when `wait=True`).
+  - Otherwise (after failure, cancellation, or in a new `Orchestral` instance backed by a shared `CheckpointStore`): loads the latest workflow checkpoint for `workflow_id`, restores and skips already-completed steps (unless `rerun_completed=True`), and launches remaining steps seeded with their latest task checkpoints.
 
-- **`async shutdown() -> None`**
-  Calls `stop()` and shuts down the runner's executor cleanly. Preserves `COMPLETED`/`FAILED` status if already finished. Idempotent.
+- **`async pause_step(target: str | Step[Any]) -> bool`** — Pauses one active step by run token, step name/alias, or `Step`.
+- **`async resume_step(target: str | Step[Any]) -> bool`** — Live-resumes one paused step by run token, step name/alias, or `Step`.
 
-- **`abort() -> None`**
-  Synchronous immediate teardown. Force-kills active subprocess groups (`SIGKILL`), cancels pending asyncio tasks and executor futures, shuts down the executor, marks a running workflow `WorkflowStatus.CANCELLED`, and unblocks `async for` consumers. Idempotent.
+- **`async wait() -> None`** — Awaits completion of an in-progress non-blocking (`wait=False`) run.
+- **`async stop() -> None`** — Gracefully cancels active/paused steps and halts subsequent waves (`WorkflowStatus.CANCELLED`). Idempotent.
+- **`async shutdown() -> None`** — Calls `stop()`, shuts down the runner/executor cleanly, and closes an owned `CheckpointStore`. Preserves `COMPLETED`/`FAILED` status if already finished. Idempotent.
+- **`abort() -> None`** — Synchronous immediate teardown (`SIGKILL` active subprocess groups, cancel tasks/futures, shut down executor, close owned store). Idempotent.
+
+### Checkpoint Methods
+
+- **`async checkpoint(target: str | Step[Any], state: Any, *, metadata: dict[str, Any] | None = None) -> Checkpoint`** — Saves an external checkpoint for an active run (by token, step name/alias, or `Step`).
+- **`async get_checkpoint(target: str | Step[Any]) -> Checkpoint | None`** — Retrieves the latest checkpoint for a token, step name/alias, or `Step`.
+- **`async list_checkpoints(token: str) -> list[Checkpoint]`** — Returns all checkpoints for a run token in sequence order.
+- **`async clear_checkpoints(target: str | Step[Any] | None = None) -> None`** — Clears checkpoints for a token, a step, or (when `None`) the entire workflow.
 
 ---
 
@@ -83,22 +116,20 @@ Main entry point for building, planning, running, streaming, and tearing down wo
 
 ```python
 class Workflow:
-    def __init__(self, config: Env | None = None) -> None
+    def __init__(
+        self,
+        config: Env | None = None,
+        checkpoint_store: CheckpointStore | None = None,
+    ) -> None
 ```
 
 Container of ordered `Group`s (and direct DAG steps) with a lazily initialized `WorkflowRunner`.
 
-- **`group() -> Group`** — Creates, appends, and returns a new explicit sequential `Group` with a unique snowflake `id`.
-- **`add_task(step, *args, alias=None, dependencies=None, ...) -> Step[T]`** — Adds a Python callable directly to the workflow DAG.
-- **`add_command(step, *args, alias=None, dependencies=None, ...) -> Step[str]`** — Adds a shell/subprocess command directly to the workflow DAG.
-- **`build_plan() -> ExecutionPlan`** — Validates the full workflow dependency graph and returns the `ExecutionPlan`.
-- **`build_waves() -> list[list[Step[Any]]]`** — Validates the graph and returns ordered concurrent waves of `Step` instances.
-- **`execution_order() -> list[list[str]]`** — Validates the graph and returns wave-by-wave step names.
-- **`groups -> list[Group]`** *(property)* — Shallow copy of registered groups.
-- **`runner -> WorkflowRunner`** *(property)* — Returns the workflow's `WorkflowRunner`, creating it on first access.
-- **`has_runner -> bool`** *(property)* — `True` if `runner` has been instantiated.
-- **`status: WorkflowStatus`** — Current workflow status.
-- Supports `len(workflow)` and `for group in workflow:`.
+- **`group() -> Group`** — Creates, appends, and returns a new explicit sequential `Group`.
+- **`add_task(step, *args, alias=None, dependencies=None, resume_from=None, ...) -> Step[T]`** — Adds a Python callable directly to the workflow DAG.
+- **`add_command(step, *args, alias=None, dependencies=None, resume_from=None, ...) -> Step[str]`** — Adds a shell/subprocess command directly to the workflow DAG.
+- **`build_plan() -> ExecutionPlan`** / **`build_waves() -> list[list[Step[Any]]]`** / **`execution_order() -> list[list[str]]`** — Validate and inspect execution waves.
+- **`groups -> list[Group]`**, **`runner -> WorkflowRunner`**, **`has_runner -> bool`**, **`status: WorkflowStatus`**.
 
 ---
 
@@ -109,77 +140,9 @@ class Group:
     def __init__(self, group_id: int) -> None
 ```
 
-A stage of `Step`s executed concurrently or in intra-group dependency waves.
-
-- **`id: int`** — Unique snowflake group identifier.
-- **`steps -> list[Step[Any]]`** *(property)* — Shallow copy of steps in the group.
-- **`build_waves() -> list[list[Step[Any]]]`** — Validates intra-group dependencies and returns concurrent waves.
-- **`execution_order() -> list[list[str]]`** — Returns wave-by-wave step names for this group.
-- Supports `len(group)` and `for step in group:`.
-
-### `add_task`
-
-```python
-def add_task(
-    self,
-    step: WorkflowTask[T],
-    *args: Any,
-    alias: str | None = None,
-    dependencies: DependenciesInput = None,
-    timeout: str | int | float | None = None,
-    schedule: str | int | float | None = None,
-    trigger: Literal["MANUAL", "ON_START"] = "MANUAL",
-    repeat: int | Literal["NEVER", "ALWAYS"] = "NEVER",
-    keep: int | None = None,
-    max_age: str | int | float | None = None,
-    keep_policy: Literal["COUNT", "AGE", "COUNT_AND_AGE"] = "COUNT",
-    **kwargs: Any,
-) -> Step[T]
-```
-
-Adds an `async` or `sync` Python callable step and returns the created `Step`.
-
-### `add_command`
-
-```python
-def add_command(
-    self,
-    step: str,
-    *args: str,
-    alias: str | None = None,
-    dependencies: DependenciesInput = None,
-    env: dict[str, Any] | None = None,
-    cwd: str | None = None,
-    shell: bool = False,
-    timeout: str | int | float | None = None,
-    schedule: str | int | float | None = None,
-    trigger: Literal["MANUAL", "ON_START"] = "MANUAL",
-    repeat: int | Literal["NEVER", "ALWAYS"] = "NEVER",
-    keep: int | None = None,
-    max_age: str | int | float | None = None,
-    keep_policy: Literal["COUNT", "AGE", "COUNT_AND_AGE"] = "COUNT",
-) -> Step[str]
-```
-
-Adds a shell/subprocess command step and returns the created `Step`.
-
----
-
-## `ExecutionPlan` & `build_execution_plan`
-
-```python
-@dataclass(frozen=True)
-class ExecutionPlan:
-    waves: list[list[Step[Any]]]
-    upstream_step_ids: dict[int, tuple[int, ...]]
-    step_by_id: dict[int, Step[Any]]
-
-    def execution_order(self) -> list[list[str]]: ...
-
-def build_execution_plan(groups: Sequence[Sequence[Step[Any]]]) -> ExecutionPlan: ...
-```
-
-Compiles one or more ordered groups of `Step`s into validated concurrent execution waves using Kahn's topological sort.
+- **`add_task(step, *args, alias=None, dependencies=None, timeout=None, schedule=None, trigger="MANUAL", repeat="NEVER", keep=None, max_age=None, keep_policy="COUNT", resume_from=None, **kwargs) -> Step[T]`**
+- **`add_command(step, *args, alias=None, dependencies=None, env=None, cwd=None, shell=False, timeout=None, schedule=None, trigger="MANUAL", repeat="NEVER", keep=None, max_age=None, keep_policy="COUNT", resume_from=None) -> Step[str]`**
+- **`build_waves() -> list[list[Step[Any]]]`**, **`execution_order() -> list[list[str]]`**, **`steps -> list[Step[Any]]`**, **`id: int`**.
 
 ---
 
@@ -192,12 +155,7 @@ class StepType(Enum):
     ASYNC = "ASYNC"
 ```
 
-`Step` validates its callable/command, dependencies, and execution options eagerly at construction time:
-
-- Accepts dependencies via positional `*deps` and/or keyword `dependencies=` (single `Step`, `str`, callable, or any iterable thereof; deduplicated in order).
-- Rejects empty command strings, non-callables, and already-instantiated coroutine objects.
-- Validates `timeout`, `schedule`, `max_age`, `repeat`, `keep`, `trigger`, `keep_policy`, and `alias`.
-- Exposes `call`, `args`, `kwargs`, `shell_args`, `dependencies`, `name`, `alias`, `type`, `timeout`, `timeout_seconds`, `schedule`, `schedule_seconds`, `trigger`, `repeat`, `keep`, `max_age`, `max_age_seconds`, `keep_policy`, `env`, `cwd`, `shell`.
+Validates callable/command, `dependencies`, `resume_from` (`str | Checkpoint | None`), `timeout`, `schedule`, `max_age`, `repeat`, `keep`, `trigger`, `keep_policy`, and `alias` eagerly at construction time.
 
 ---
 
@@ -209,6 +167,7 @@ class WorkflowStatus(Enum):
     FAILED = "FAILED"
     READY = "READY"
     RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
     CANCELLED = "CANCELLED"
 ```
 
@@ -217,17 +176,14 @@ class WorkflowStatus(Enum):
 ## Exceptions
 
 - **`OrchestralError(Exception)`** — Base class for orchestral exceptions.
-- **`OrchestralGraphError(OrchestralError, ValueError)`** — Invalid dependency graph (missing step, external step not in workflow, or dependency pointing to a later group).
-- **`OrchestralCycleError(OrchestralGraphError)`** — Dependency cycle detected. Exposes `cycle: list[str]`.
-- **`OrchestralTaskFailure(OrchestralError)`** — Assigned to `orch.error` when a step fails under `fail_fast=True`. Exposes `error: str`, `trace: str | None`, `task_name: str | None`, and `run_id: int | None`.
+- **`OrchestralGraphError(OrchestralError, ValueError)`** — Invalid dependency graph (missing step, external step not in workflow, or forward dependency into a later group).
+- **`OrchestralCycleError(OrchestralGraphError)`** — Dependency cycle detected; exposes `cycle: list[str]`.
+- **`OrchestralTaskFailure(OrchestralError)`** — Assigned to `orch.error` when a step fails under `fail_fast=True`; exposes `error`, `trace`, `task_name`, `run_id`.
 
 ---
 
-## Result & Configuration Models (from `taskex`)
+## Re-Exported `taskex` Checkpointing, Pause & Result Types
 
-`orchestral` returns standard `taskex` Pydantic models:
-
-- **`taskex.Env`** — Configuration model (`MERCURY_SYNC_EXECUTOR_TYPE`: `"process" | "thread"`, `MERCURY_SYNC_TASK_RUNNER_MAX_THREADS`: `int`, etc.).
-- **`taskex.models.ShellProcess`** — Result for shell steps (`run_id`, `task_name`, `process_id`, `command`, `args`, `status`, `return_code`, `env`, `working_directory`, `command_type`, `result` (stdout), `error` (stderr or failure message), `trace`, `start`, `end`, `elapsed`).
-- **`taskex.models.TaskRun`** — Result for Python callable steps (`run_id`, `task_name`, `status`, `result`, `error`, `trace`, `start`, `end`, `elapsed`).
-- **`taskex.models.RunStatus`** — Per-run status enum (`CREATED`, `PENDING`, `IDLE`, `RUNNING`, `COMPLETE`, `CANCELLED`, `FAILED`).
+- **Stores**: `CheckpointStore`, `MemoryCheckpointStore`, `SQLiteCheckpointStore`
+- **In-task helpers**: `RunContext`, `get_run_context()`, `last_checkpoint()`, `checkpoint()`, `checkpoint_sync()`, `pause_point()`, `pause_point_sync()`
+- **Models & Config**: `Env` (including `MERCURY_SYNC_EXECUTOR_TYPE: "process" | "thread" | "none"` and `MERCURY_SYNC_CHECKPOINT_DB_PATH`), `Checkpoint`, `ShellProcess` (with `.checkpoint`, `.paused_duration`), `TaskRun` (with `.checkpoint`, `.paused_duration`), `RunStatus` (including `RunStatus.PAUSED`).

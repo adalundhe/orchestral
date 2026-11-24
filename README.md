@@ -1,6 +1,6 @@
 # orchestral
 
-Orchestrate and execute shell commands, async coroutines, and sync Python functions in dependency-graph waves and sequential groups.
+Orchestrate and execute shell commands, async coroutines, and sync Python functions in dependency-graph waves with pause, resume, and durable checkpointing.
 
 [![PyPI version](https://img.shields.io/pypi/v/orchestral?color=blue)](https://pypi.org/project/orchestral/)
 [![License](https://img.shields.io/github/license/adalundhe/orchestral)](https://github.com/adalundhe/orchestral/blob/main/LICENSE)
@@ -8,7 +8,7 @@ Orchestrate and execute shell commands, async coroutines, and sync Python functi
 
 | Package  | orchestral                                       |
 | -------- | ------------------------------------------------ |
-| Version  | 0.3.0                                            |
+| Version  | 0.4.0                                            |
 | Download | https://pypi.org/project/orchestral/             |
 | Source   | https://github.com/adalundhe/orchestral          |
 | Keywords | async, tasks, workflow, runner, graph, shell, jobs |
@@ -18,6 +18,10 @@ Orchestrate and execute shell commands, async coroutines, and sync Python functi
 - **Unified task orchestration**: Mix shell commands (`add_command`), `async def` coroutines, and synchronous Python callables (`add_task`) in the same workflow.
 - **Dependency-graph wave execution**: Declare step `dependencies` by name/alias, callable, or `Step` reference; `orchestral` validates the DAG (detecting missing dependencies and cycles upfront) and executes topologically sorted parallel waves.
 - **Explicit sequential groups**: Organize stages with `workflow.group()` when you want strict stage barriers, with optional intra-group or cross-group dependencies.
+- **Suspension, resumption & durable checkpointing** *(powered by `taskex >= 0.5.0`)*:
+  - Live `await orch.pause()` / `await orch.resume()` (and per-step `pause_step()` / `resume_step()`) across async tasks, thread-pool sync tasks, POSIX shell subprocesses (`SIGSTOP`/`SIGCONT`), and repeating schedules—with **pause-aware timeouts**.
+  - Cooperative in-task `checkpoint()` / `pause_point()` / `last_checkpoint()` helpers (async & sync) plus external checkpoint inspection APIs.
+  - Workflow-level & cross-process crash recovery with `MemoryCheckpointStore`, durable `SQLiteCheckpointStore` (via `Env(MERCURY_SYNC_CHECKPOINT_DB_PATH=...)` or explicit store), or custom sync/async `CheckpointStore` backends—skipping already-completed waves and resuming failed/cancelled steps from their latest checkpoint.
 - **Streaming wave results**: Consume each wave's results as it completes using `async for batch in orch:`.
 - **Fail-fast & branch-aware failure handling**: Under `fail_fast=True`, failures immediately cancel in-flight siblings and halt remaining waves; under `fail_fast=False`, independent branches continue while steps with failed explicit upstream dependencies are safely skipped (`RunStatus.CANCELLED`).
 - **Timeouts at every level**: Enforce deadlines on individual steps or the entire workflow using numbers (seconds) or duration strings (`"500ms"`, `"5s"`, `"1m30s"`).
@@ -26,7 +30,7 @@ Orchestrate and execute shell commands, async coroutines, and sync Python functi
 
 ## Installation
 
-Requires Python 3.11 or newer.
+Requires Python 3.11+ and `taskex >= 0.5.0`.
 
 ```bash
 pip install orchestral
@@ -86,12 +90,57 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+### Checkpointing, live pause & crash recovery
+
+```python
+import asyncio
+from orchestral import (
+    Env,
+    Orchestral,
+    SQLiteCheckpointStore,
+    checkpoint,
+    last_checkpoint,
+    pause_point,
+)
+
+
+async def etl(items: list[str]) -> list[str]:
+    prev = last_checkpoint()
+    start_idx = prev.state["idx"] if prev else 0
+    done = list(prev.state["done"]) if prev else []
+
+    for i in range(start_idx, len(items)):
+        await pause_point()
+        done.append(items[i].upper())
+        await checkpoint({"idx": i + 1, "done": done})
+
+    return done
+
+
+async def main() -> None:
+    with SQLiteCheckpointStore("state/workflow.db") as store:
+        async with Orchestral(
+            config=Env(MERCURY_SYNC_EXECUTOR_TYPE="none"),
+            checkpoint_store=store,
+            workflow_id="daily-etl",
+        ) as orch:
+            with orch as wf:
+                s1 = wf.add_command("echo", "ready", alias="preflight")
+                wf.add_task(etl, ["a", "b", "c"], dependencies=[s1])
+
+            await orch.run(wait=False, fail_fast=True)
+            await orch.pause()              # Live suspend active steps & freeze timeout
+            await orch.resume(wait=True)    # Live resume (or recover from SQLite after failure)
+
+
+asyncio.run(main())
+```
+
 ### Explicit sequential groups
 
 ```python
 import asyncio
-from taskex import Env
-from orchestral import Orchestral
+from orchestral import Env, Orchestral
 
 
 async def fetch_greeting(name: str) -> str:
@@ -172,22 +221,22 @@ finally:
 
 ### Executor configuration
 
-Synchronous functions passed to `add_task()` run in either a `ProcessPoolExecutor` (default) or a `ThreadPoolExecutor`, configured via `taskex.Env`:
+Synchronous functions passed to `add_task()` run in either a `ProcessPoolExecutor` (default), a `ThreadPoolExecutor`, or the default loop executor (`"none"`), configured via `taskex.Env`:
 
 ```python
-from taskex import Env
-from orchestral import Orchestral
+from orchestral import Env, Orchestral
 
-# Use threads for closures, lambdas, bound methods, or I/O-bound sync code
+# Use threads for closures, lambdas, bound methods, or sync checkpointing/pause
 orch = Orchestral(
     config=Env(
         MERCURY_SYNC_EXECUTOR_TYPE="thread",
         MERCURY_SYNC_TASK_RUNNER_MAX_THREADS=4,
+        MERCURY_SYNC_CHECKPOINT_DB_PATH="./state/checkpoints.db",
     )
 )
 ```
 
-> **Note:** When using the default `"process"` executor, sync callables and their arguments must be picklable (e.g. top-level module functions). Pure shell and async workflows never spawn an executor.
+> **Note:** When using `"process"` mode, sync callables and arguments must be picklable, and in-task `ContextVar` checkpoint/pause helpers require `"thread"` or `"none"` mode. Pure shell and async workflows never spawn a sync executor when `config` is omitted.
 
 ## Documentation
 
@@ -196,12 +245,14 @@ Detailed guides and API reference live in [`docs/`](docs/index.md):
 - [Documentation Index](docs/index.md)
 - [Getting Started](docs/getting-started.md)
 - [Execution Model & Configuration](docs/execution-model.md)
+- [Checkpointing, Pause & Resume](docs/checkpointing-and-pause.md)
 - [Error Handling, Timeouts & Lifecycle](docs/error-handling-and-lifecycle.md)
 - [API Reference](docs/api-reference.md)
 
 Runnable examples are available in [`examples/`](examples/):
 
 - [`examples/dag_workflow.py`](examples/dag_workflow.py)
+- [`examples/checkpoint_resume_workflow.py`](examples/checkpoint_resume_workflow.py)
 - [`examples/shell_workflow.py`](examples/shell_workflow.py)
 - [`examples/mixed_workflow.py`](examples/mixed_workflow.py)
 

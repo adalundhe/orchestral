@@ -1,12 +1,12 @@
 from typing import Any, Iterator, Literal, TypeVar
 
-from taskex import Env
-from taskex.snowflake import SnowflakeGenerator
+from taskex import CheckpointStore, Env
 
 from .graph import ExecutionPlan, build_execution_plan
 from .group import Group
 from .runner import WorkflowRunner
-from .step import DependenciesInput, Step, WorkflowTask
+from .step import DependenciesInput, ResumeFromInput, Step, WorkflowTask
+from .util import get_shared_snowflake_generator
 from .workflow_status import WorkflowStatus
 
 T = TypeVar("T")
@@ -16,18 +16,23 @@ class Workflow:
     def __init__(
         self,
         config: Env | None = None,
+        checkpoint_store: CheckpointStore | None = None,
     ) -> None:
         self._config = config
+        self._checkpoint_store = checkpoint_store
         self._groups: list[Group] = []
         self._default_group: Group | None = None
-        self._snowflake_generator = SnowflakeGenerator(0)
+        self._snowflake_generator = get_shared_snowflake_generator()
         self._runner: WorkflowRunner | None = None
         self.status = WorkflowStatus.READY
 
     @property
     def runner(self) -> WorkflowRunner:
         if self._runner is None:
-            self._runner = WorkflowRunner(config=self._config)
+            self._runner = WorkflowRunner(
+                config=self._config,
+                checkpoint_store=self._checkpoint_store,
+            )
         return self._runner
 
     @property
@@ -70,6 +75,7 @@ class Workflow:
         keep: int | None = None,
         max_age: str | int | float | None = None,
         keep_policy: Literal["COUNT", "AGE", "COUNT_AND_AGE"] = "COUNT",
+        resume_from: ResumeFromInput = None,
         **kwargs: Any,
     ) -> Step[T]:
         """Add a Python task step directly to the workflow DAG."""
@@ -85,6 +91,7 @@ class Workflow:
             keep=keep,
             max_age=max_age,
             keep_policy=keep_policy,
+            resume_from=resume_from,
             **kwargs,
         )
 
@@ -104,6 +111,7 @@ class Workflow:
         keep: int | None = None,
         max_age: str | int | float | None = None,
         keep_policy: Literal["COUNT", "AGE", "COUNT_AND_AGE"] = "COUNT",
+        resume_from: ResumeFromInput = None,
     ) -> Step[str]:
         """Add a shell/subprocess step directly to the workflow DAG."""
         return self._ensure_default_group().add_command(
@@ -121,6 +129,7 @@ class Workflow:
             keep=keep,
             max_age=max_age,
             keep_policy=keep_policy,
+            resume_from=resume_from,
         )
 
     def build_plan(self) -> ExecutionPlan:

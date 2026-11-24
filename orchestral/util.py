@@ -1,8 +1,18 @@
 import functools
 import inspect
 import math
+import os
 import re
 from typing import Any
+
+from taskex.snowflake import SnowflakeGenerator
+
+_SHARED_SNOWFLAKE = SnowflakeGenerator(os.getpid() % 1024)
+
+
+def get_shared_snowflake_generator() -> SnowflakeGenerator:
+    """Return a process-wide thread-safe SnowflakeGenerator to prevent ID collisions."""
+    return _SHARED_SNOWFLAKE
 
 _DURATION_TOKEN_RE = re.compile(
     r"(?P<val>\d+(?:\.\d+)?)(?P<unit>ms|[smhdw])?",

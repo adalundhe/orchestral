@@ -96,7 +96,7 @@ async def test_shell_nonexistent_command_fails_cleanly():
         res = next(iter(orch.results["definitely_nonexistent_binary_orchestral_xyz"].values()))
         assert isinstance(res, ShellProcess)
         assert res.status == RunStatus.FAILED
-        assert res.process_id == -1
+        assert res.process_id is None
         assert res.error is not None
         assert res.elapsed >= 0
 

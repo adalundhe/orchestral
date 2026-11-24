@@ -1,7 +1,7 @@
 from typing import Any, Iterator, Literal, TypeVar
 
 from .graph import build_execution_plan
-from .step import DependenciesInput, Step, WorkflowTask
+from .step import DependenciesInput, ResumeFromInput, Step, WorkflowTask
 
 T = TypeVar("T")
 
@@ -45,6 +45,7 @@ class Group:
         keep: int | None = None,
         max_age: str | int | float | None = None,
         keep_policy: Literal["COUNT", "AGE", "COUNT_AND_AGE"] = "COUNT",
+        resume_from: ResumeFromInput = None,
         **kwargs: Any,
     ) -> Step[T]:
         created = Step(
@@ -60,6 +61,7 @@ class Group:
             keep=keep,
             max_age=max_age,
             keep_policy=keep_policy,
+            resume_from=resume_from,
         )
         self._steps.append(created)
         return created
@@ -80,6 +82,7 @@ class Group:
         keep: int | None = None,
         max_age: str | int | float | None = None,
         keep_policy: Literal["COUNT", "AGE", "COUNT_AND_AGE"] = "COUNT",
+        resume_from: ResumeFromInput = None,
     ) -> Step[str]:
         if not isinstance(step, str):
             raise TypeError(
@@ -101,6 +104,7 @@ class Group:
             keep=keep,
             max_age=max_age,
             keep_policy=keep_policy,
+            resume_from=resume_from,
         )
         self._steps.append(created)
         return created

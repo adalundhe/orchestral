@@ -9,6 +9,8 @@ from typing import (
     TypeVar,
 )
 
+from taskex.models import Checkpoint
+
 from .step_type import StepType
 from .util import is_async_callable, parse_duration, resolve_callable_name
 
@@ -18,6 +20,7 @@ WorkflowTask = Callable[..., Awaitable[T]] | Callable[..., T]
 WorkflowStep = str | WorkflowTask[T]
 DependencySpec = WorkflowStep[Any] | "Step[Any]"
 DependenciesInput = DependencySpec | Iterable[DependencySpec] | None
+ResumeFromInput = str | Checkpoint | None
 
 _VALID_TRIGGERS = ("MANUAL", "ON_START")
 _VALID_KEEP_POLICIES = ("COUNT", "AGE", "COUNT_AND_AGE")
@@ -95,6 +98,7 @@ class Step(Generic[T]):
         keep: int | None = None,
         max_age: str | int | float | None = None,
         keep_policy: Literal["COUNT", "AGE", "COUNT_AND_AGE"] = "COUNT",
+        resume_from: ResumeFromInput = None,
     ) -> None:
         if isinstance(step, str):
             if not step.strip():
@@ -147,6 +151,13 @@ class Step(Generic[T]):
         if alias is not None and (not isinstance(alias, str) or not alias):
             raise ValueError("alias must be a non-empty string or None")
 
+        if resume_from is not None and not isinstance(resume_from, (str, Checkpoint)):
+            raise TypeError(
+                f"resume_from must be a str, Checkpoint, or None, got {type(resume_from).__name__}"
+            )
+        if isinstance(resume_from, str) and not resume_from.strip():
+            raise ValueError("resume_from string cannot be empty")
+
         dep_refs, dep_names = _normalize_dependencies(deps, dependencies)
 
         self.call = step
@@ -164,6 +175,7 @@ class Step(Generic[T]):
         self.keep = keep
         self.max_age = max_age
         self.keep_policy = keep_policy
+        self.resume_from = resume_from
 
         self.env = dict(env) if env is not None else None
         self.cwd = cwd

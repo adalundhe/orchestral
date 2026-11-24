@@ -17,14 +17,17 @@ Graph validation errors are raised directly before the workflow transitions out 
 | -------------------------- | ----------------------------------------------------------------------------------- |
 | `WorkflowStatus.READY`     | Workflow has been created and has not started running yet.                          |
 | `WorkflowStatus.RUNNING`   | Workflow is currently executing.                                                    |
+| `WorkflowStatus.PAUSED`    | Workflow is suspended via `pause()`; active steps are paused and timeout is frozen. |
 | `WorkflowStatus.COMPLETED` | All waves finished without a workflow-level failure, timeout, or cancellation.      |
 | `WorkflowStatus.FAILED`    | Workflow failed due to `fail_fast=True`, a workflow timeout, or an internal error.  |
 | `WorkflowStatus.CANCELLED` | Workflow was cancelled mid-run via `stop()`, `shutdown()`, `abort()`, or task cancel.|
 
 ```
-READY ──▶ RUNNING ──┬──▶ COMPLETED
-                    ├──▶ FAILED     (fail_fast task failure, workflow timeout, exception)
-                    └──▶ CANCELLED  (stop, shutdown, abort, or outer task cancellation)
+READY ──▶ RUNNING ◀──▶ PAUSED
+             │
+             ├──▶ COMPLETED
+             ├──▶ FAILED     (fail_fast task failure, workflow timeout, exception)
+             └──▶ CANCELLED  (stop, shutdown, abort, or outer task cancellation)
 ```
 
 Calling `shutdown()` or `abort()` **after** a workflow has already reached `COMPLETED` or `FAILED` preserves that terminal status.

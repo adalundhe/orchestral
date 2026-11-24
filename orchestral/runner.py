@@ -1,82 +1,55 @@
 import asyncio
-import concurrent.futures
 import functools
-import os
+import inspect
 import pathlib
-import shlex
-import signal
-import time
-import traceback
-from asyncio.subprocess import Process
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from taskex import Env
-from taskex.models import RunStatus, ShellProcess, TaskRun, TaskType
+from taskex import (
+    Checkpoint,
+    CheckpointStore,
+    Env,
+    MemoryCheckpointStore,
+    Run,
+    RunStatus,
+    ShellProcess,
+    SQLiteCheckpointStore,
+    TaskRun,
+    TaskRunner,
+)
 from taskex.snowflake import SnowflakeGenerator
 
-from .step import Step
+from .step import ResumeFromInput, Step
 from .step_type import StepType
-from .util import is_async_callable
+from .util import get_shared_snowflake_generator
 
 StepResult = ShellProcess | TaskRun
 
-_IS_POSIX = os.name == "posix"
-_TERMINATE_GRACE_SECONDS = 0.5
+_TASKEX_RUN_RESERVED_KWARGS = frozenset(
+    {
+        "alias",
+        "run_id",
+        "timeout",
+        "schedule",
+        "trigger",
+        "repeat",
+        "keep",
+        "max_age",
+        "keep_policy",
+        "resume_from",
+    }
+)
 
 
-def _kill_process_sync(process: Process, *, force: bool = False) -> None:
-    """Terminate or kill a subprocess (and its process group on POSIX) without raising."""
-    if process.returncode is not None:
-        return
-
-    sig = signal.SIGKILL if force else signal.SIGTERM
-    if _IS_POSIX and process.pid is not None:
-        try:
-            os.killpg(process.pid, sig)
-            return
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-
-    try:
-        if force:
-            process.kill()
-        else:
-            process.terminate()
-    except (ProcessLookupError, OSError):
-        pass
-
-
-async def _terminate_and_reap_process(
-    process: Process,
-    *,
-    grace_seconds: float = _TERMINATE_GRACE_SECONDS,
-) -> None:
-    """Gracefully terminate a subprocess, escalate to SIGKILL if needed, and reap it."""
-    if process.returncode is not None:
-        return
-
-    _kill_process_sync(process, force=False)
-    try:
-        await asyncio.wait_for(process.wait(), timeout=grace_seconds)
-    except asyncio.TimeoutError:
-        _kill_process_sync(process, force=True)
-        try:
-            await process.wait()
-        except (ProcessLookupError, OSError):
-            pass
-    except asyncio.CancelledError:
-        _kill_process_sync(process, force=True)
-        try:
-            await process.wait()
-        except BaseException:
-            pass
-        raise
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 def _kill_process_pool_workers(executor: ProcessPoolExecutor) -> None:
-    """Best-effort kill of stuck ProcessPoolExecutor worker processes on abort."""
+    """Best-effort kill of stuck ProcessPoolExecutor worker processes on forced teardown."""
     processes = getattr(executor, "_processes", None)
     if not isinstance(processes, dict):
         return
@@ -90,81 +63,276 @@ def _kill_process_pool_workers(executor: ProcessPoolExecutor) -> None:
 
 @dataclass
 class RunHandle:
-    """Tracks an in-flight step execution inside WorkflowRunner."""
+    """Tracks an in-flight step execution delegated to ``taskex.TaskRunner``."""
 
     run_id: int
     task_name: str
-    status: RunStatus = RunStatus.CREATED
-    start: float = field(default_factory=time.monotonic)
+    run: Run
+    is_scheduled: bool = False
     task: asyncio.Task[StepResult] | None = None
-    process: Process | None = None
-    cf_future: concurrent.futures.Future[Any] | None = None
     history: list[StepResult] = field(default_factory=list)
 
     @property
     def token(self) -> str:
-        return f"{self.task_name}:{self.run_id}"
+        return self.run.token
+
+    @property
+    def status(self) -> RunStatus:
+        return self.run.status
 
 
 class WorkflowRunner:
-    """Leak-free async runner for shell, async, and sync workflow steps.
+    """Async workflow step runner backed by ``taskex.TaskRunner`` (>= 0.5.0).
 
-    Returns ``taskex.models.ShellProcess`` and ``taskex.models.TaskRun`` models
-    and honors ``taskex.Env`` executor configuration without leaking executors,
-    subprocesses, semaphores, asyncio tasks, or signal handlers.
+    Provides lazy executor initialization, pause/resume (live and from
+    checkpoints), checkpoint store integration, repeating schedule completion,
+    fail-fast sibling cancellation, and leak-free shutdown/abort.
     """
 
     def __init__(
         self,
         instance_id: int = 0,
         config: Env | None = None,
+        checkpoint_store: CheckpointStore | None = None,
     ) -> None:
-        self._config = config if config is not None else Env()
-        self._snowflake_generator = SnowflakeGenerator(instance_id)
-        self._executor: ThreadPoolExecutor | ProcessPoolExecutor | None = None
-        self._executor_semaphore: asyncio.Semaphore | None = None
-        self._semaphore_loop: asyncio.AbstractEventLoop | None = None
+        self._instance_id = instance_id
+        self._config = config
+        self._snowflake_generator = (
+            get_shared_snowflake_generator()
+            if instance_id == 0
+            else SnowflakeGenerator(instance_id)
+        )
+
+        if checkpoint_store is not None:
+            self._checkpoint_store: CheckpointStore = checkpoint_store
+            self._owns_checkpoint_store = False
+        elif config is not None and config.MERCURY_SYNC_CHECKPOINT_DB_PATH is not None:
+            self._checkpoint_store = SQLiteCheckpointStore(
+                config.MERCURY_SYNC_CHECKPOINT_DB_PATH
+            )
+            self._owns_checkpoint_store = True
+        else:
+            self._checkpoint_store = MemoryCheckpointStore()
+            self._owns_checkpoint_store = True
+
+        self._task_runner: TaskRunner | None = None
         self._active_runs: dict[str, RunHandle] = {}
-        self._active_cf_futures: set[concurrent.futures.Future[Any]] = set()
         self._closed = False
+
+    @property
+    def checkpoint_store(self) -> CheckpointStore:
+        return self._checkpoint_store
+
+    @property
+    def _executor(self) -> ThreadPoolExecutor | ProcessPoolExecutor | None:
+        if self._task_runner is None:
+            return None
+        return self._task_runner._executor
+
+    @property
+    def active_tokens(self) -> list[str]:
+        return list(self._active_runs)
 
     def create_task_id(self) -> int:
         return self._snowflake_generator.generate()
 
-    def _max_workers(self) -> int:
-        configured = self._config.MERCURY_SYNC_TASK_RUNNER_MAX_THREADS
-        if configured is None or configured <= 0:
-            return os.cpu_count() or 1
-        return configured
-
-    def _ensure_executor(
-        self,
-        loop: asyncio.AbstractEventLoop,
-    ) -> tuple[ThreadPoolExecutor | ProcessPoolExecutor, asyncio.Semaphore]:
-        if self._closed:
-            self._closed = False
-
-        max_workers = self._max_workers()
-        if self._executor is None:
-            if self._config.MERCURY_SYNC_EXECUTOR_TYPE == "thread":
-                self._executor = ThreadPoolExecutor(max_workers=max_workers)
+    def _ensure_task_runner(self, *, needs_sync_executor: bool = True) -> TaskRunner:
+        if self._task_runner is not None and not self._task_runner._is_shutdown:
+            if (
+                needs_sync_executor
+                and self._config is None
+                and self._task_runner._executor is None
+            ):
+                # Default Env() uses ProcessPoolExecutor when sync tasks are needed;
+                # only upgrade if no tasks are currently active.
+                if not self._active_runs:
+                    self._task_runner.abort()
+                    self._task_runner = None
             else:
-                self._executor = ProcessPoolExecutor(max_workers=max_workers)
+                return self._task_runner
 
-        if self._executor_semaphore is None or self._semaphore_loop is not loop:
-            self._executor_semaphore = asyncio.Semaphore(max_workers)
-            self._semaphore_loop = loop
-
-        return self._executor, self._executor_semaphore
-
-    def run_step(self, step: Step[Any]) -> RunHandle:
-        """Schedule a ``Step`` for immediate execution and return its ``RunHandle``."""
         self._closed = False
-        run_id = self._snowflake_generator.generate()
-        handle = RunHandle(run_id=run_id, task_name=step.name)
-        handle.task = asyncio.create_task(self._execute_step(handle, step))
+        if self._config is not None:
+            effective_config = self._config
+        elif needs_sync_executor:
+            effective_config = Env()
+        else:
+            effective_config = Env(MERCURY_SYNC_EXECUTOR_TYPE="none")
+
+        self._task_runner = TaskRunner(
+            instance_id=self._instance_id,
+            config=effective_config,
+            checkpoint_store=self._checkpoint_store,
+        )
+        self._task_runner._snowflake_generator = self._snowflake_generator
+        return self._task_runner
+
+    def prepare_for_steps(self, steps: list[Step[Any]]) -> None:
+        """Lazily initialize the underlying TaskRunner tailored to the planned steps."""
+        needs_sync = any(step.type == StepType.SYNC for step in steps)
+        self._ensure_task_runner(needs_sync_executor=needs_sync)
+
+    async def resolve_checkpoint(
+        self,
+        resume_from: ResumeFromInput,
+    ) -> Checkpoint | None:
+        """Resolve a checkpoint token, task name, or Checkpoint object (sync or async store)."""
+        if resume_from is None:
+            return None
+        if isinstance(resume_from, Checkpoint):
+            return resume_from
+
+        if ":" in resume_from:
+            task_name, run_id_str = resume_from.rsplit(":", maxsplit=1)
+            try:
+                run_id = int(run_id_str)
+            except ValueError as err:
+                raise ValueError(f"Invalid checkpoint token: {resume_from!r}") from err
+            return await _maybe_await(
+                self._checkpoint_store.get_latest(task_name, run_id)
+            )
+
+        return await _maybe_await(
+            self._checkpoint_store.get_latest_for_task(resume_from)
+        )
+
+    def _launch_taskex_run(
+        self,
+        step: Step[Any],
+        *,
+        initial_checkpoint: Checkpoint | None = None,
+    ) -> tuple[TaskRunner, Run, bool]:
+        runner = self._ensure_task_runner(
+            needs_sync_executor=(step.type == StepType.SYNC)
+        )
+        is_scheduled = step.repeat != "NEVER"
+        effective_schedule: float | None = step.schedule_seconds
+        if is_scheduled and effective_schedule is None:
+            effective_schedule = 0.0
+
+        # Ensure per-step repeat/schedule settings don't inherit stale Task settings
+        # when the same task_name is reused with different parameters.
+        existing_task = runner.tasks.get(step.name)
+        if existing_task is not None:
+            existing_task.repeat = step.repeat
+            existing_task.schedule = effective_schedule
+            existing_task.timeout = step.timeout_seconds
+            existing_task.keep = 10 if step.keep is None else step.keep
+            existing_task.max_age = step.max_age_seconds
+            existing_task.keep_policy = step.keep_policy
+
+        if step.type == StepType.SHELL:
+            assert isinstance(step.call, str)
+            env_map = (
+                {str(k): str(v) for k, v in step.env.items()}
+                if step.env is not None
+                else None
+            )
+            run = runner.command(
+                step.call,
+                *step.shell_args,
+                alias=step.name,
+                env=env_map,
+                cwd=step.cwd,
+                shell=step.shell,
+                timeout=step.timeout_seconds,
+                schedule=effective_schedule,
+                trigger=step.trigger,
+                repeat=step.repeat,
+                keep=step.keep,
+                max_age=step.max_age_seconds,
+                keep_policy=step.keep_policy,
+                resume_from=initial_checkpoint,
+            )
+            return runner, run, is_scheduled
+
+        has_reserved = any(k in _TASKEX_RUN_RESERVED_KWARGS for k in step.kwargs)
+        if has_reserved:
+            target = functools.partial(step.call, *step.args, **step.kwargs)
+            call_args: tuple[Any, ...] = ()
+            call_kwargs: dict[str, Any] = {}
+        else:
+            target = step.call
+            call_args = step.args
+            call_kwargs = step.kwargs
+
+        run = runner.run(
+            target,
+            *call_args,
+            alias=step.name,
+            timeout=step.timeout_seconds,
+            schedule=effective_schedule,
+            trigger=step.trigger,
+            repeat=step.repeat,
+            keep=step.keep,
+            max_age=step.max_age_seconds,
+            keep_policy=step.keep_policy,
+            resume_from=initial_checkpoint,
+            **call_kwargs,
+        )
+        return runner, run, is_scheduled
+
+    def run_step(
+        self,
+        step: Step[Any],
+        *,
+        initial_checkpoint: Checkpoint | None = None,
+    ) -> RunHandle:
+        """Schedule a ``Step`` on ``taskex.TaskRunner`` and return its ``RunHandle``."""
+        runner, run, is_scheduled = self._launch_taskex_run(
+            step,
+            initial_checkpoint=initial_checkpoint,
+        )
+        handle = RunHandle(
+            run_id=run.run_id,
+            task_name=run.task_name,
+            run=run,
+            is_scheduled=is_scheduled,
+        )
+        handle.task = asyncio.create_task(self._await_step_handle(runner, handle, step))
         self._active_runs[handle.token] = handle
         return handle
+
+    async def _await_step_handle(
+        self,
+        runner: TaskRunner,
+        handle: RunHandle,
+        step: Step[Any],
+    ) -> StepResult:
+        if not handle.is_scheduled:
+            try:
+                return await runner.wait(handle.token)
+            except asyncio.CancelledError:
+                await runner.cancel(handle.token)
+                raise
+
+        task_obj = runner.tasks[handle.task_name]
+        schedule_id = handle.run_id
+        schedule_task = task_obj._schedules.get(schedule_id)
+
+        try:
+            if schedule_task is not None:
+                await schedule_task
+
+            # Await any runs spawned by this scheduled step (snowflake IDs are monotonic)
+            spawned = [
+                r
+                for rid, r in sorted(task_obj._runs.items())
+                if rid >= schedule_id
+            ]
+            if spawned:
+                results = await asyncio.gather(*(r.wait() for r in spawned))
+            else:
+                results = [await handle.run.wait()]
+
+            await task_obj.cleanup()
+            retained_ids = set(task_obj._runs.keys())
+            retained_results = [res for res in results if res.run_id in retained_ids]
+            handle.history = retained_results if retained_results else [results[-1]]
+            return handle.history[-1]
+        except asyncio.CancelledError:
+            await runner.cancel_schedule(handle.token)
+            raise
 
     def command(
         self,
@@ -181,6 +349,7 @@ class WorkflowRunner:
         keep: int | None = None,
         max_age: str | int | float | None = None,
         keep_policy: Literal["COUNT", "AGE", "COUNT_AND_AGE"] = "COUNT",
+        resume_from: ResumeFromInput = None,
     ) -> RunHandle:
         step: Step[str] = Step(
             command,
@@ -196,8 +365,10 @@ class WorkflowRunner:
             keep=keep,
             max_age=max_age,
             keep_policy=keep_policy,
+            resume_from=resume_from,
         )
-        return self.run_step(step)
+        cp = resume_from if isinstance(resume_from, Checkpoint) else None
+        return self.run_step(step, initial_checkpoint=cp)
 
     def run(
         self,
@@ -211,6 +382,7 @@ class WorkflowRunner:
         keep: int | None = None,
         max_age: str | int | float | None = None,
         keep_policy: Literal["COUNT", "AGE", "COUNT_AND_AGE"] = "COUNT",
+        resume_from: ResumeFromInput = None,
         **kwargs: Any,
     ) -> RunHandle:
         step = Step(
@@ -225,8 +397,87 @@ class WorkflowRunner:
             keep=keep,
             max_age=max_age,
             keep_policy=keep_policy,
+            resume_from=resume_from,
         )
-        return self.run_step(step)
+        cp = resume_from if isinstance(resume_from, Checkpoint) else None
+        return self.run_step(step, initial_checkpoint=cp)
+
+    async def pause(self, token: str) -> bool:
+        if self._task_runner is None:
+            return False
+        handle = self._active_runs.get(token)
+        if handle is not None and handle.is_scheduled:
+            return await self._task_runner.pause_schedule(token)
+        return await self._task_runner.pause(token)
+
+    async def resume(self, token: str) -> bool:
+        if self._task_runner is None:
+            return False
+        handle = self._active_runs.get(token)
+        if handle is not None and handle.is_scheduled:
+            return await self._task_runner.resume_schedule(token)
+        if handle is not None:
+            return await handle.run.resume()
+        task_name, run_id = TaskRunner._parse_token(token)
+        task = self._task_runner.tasks.get(task_name)
+        if task is None:
+            return False
+        existing = task._runs.get(run_id)
+        if existing is not None and existing.paused:
+            return await existing.resume()
+        return False
+
+    async def pause_all(self) -> list[str]:
+        paused_tokens: list[str] = []
+        for token in list(self._active_runs):
+            if await self.pause(token):
+                paused_tokens.append(token)
+        return paused_tokens
+
+    async def resume_all(self) -> list[str]:
+        resumed_tokens: list[str] = []
+        for token in list(self._active_runs):
+            if await self.resume(token):
+                resumed_tokens.append(token)
+        return resumed_tokens
+
+    async def checkpoint(
+        self,
+        token: str,
+        state: Any,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> Checkpoint:
+        if self._task_runner is None:
+            raise KeyError(f"No active runner for token {token!r}")
+        return await self._task_runner.checkpoint(token, state, metadata=metadata)
+
+    async def get_checkpoint(self, token: str) -> Checkpoint | None:
+        if self._task_runner is not None:
+            return await self._task_runner.get_checkpoint(token)
+        return await self.resolve_checkpoint(token)
+
+    async def get_latest_task_checkpoint(self, task_name: str) -> Checkpoint | None:
+        if self._task_runner is not None:
+            return await self._task_runner.get_latest_task_checkpoint(task_name)
+        return await _maybe_await(
+            self._checkpoint_store.get_latest_for_task(task_name)
+        )
+
+    async def list_checkpoints(self, token: str) -> list[Checkpoint]:
+        if self._task_runner is not None:
+            return await self._task_runner.list_checkpoints(token)
+        task_name, run_id = TaskRunner._parse_token(token)
+        return await _maybe_await(
+            self._checkpoint_store.list_checkpoints(task_name, run_id)
+        )
+
+    async def clear_checkpoints(self, token: str) -> None:
+        if self._task_runner is not None:
+            await self._task_runner.clear_checkpoints(token)
+            return
+        task_name, run_id = TaskRunner._parse_token(token)
+        await _maybe_await(self._checkpoint_store.delete(task_name, run_id))
 
     async def wait(self, token: str) -> StepResult | None:
         handle = self._active_runs.get(token)
@@ -269,11 +520,7 @@ class WorkflowRunner:
         self,
         tokens: list[str],
     ) -> tuple[list[StepResult], StepResult | None]:
-        """Await runs in ``tokens``, cancelling remaining siblings on first failure.
-
-        Returns ``(completed_results, first_failed_result)`` with
-        ``completed_results`` ordered according to ``tokens``.
-        """
+        """Await runs in ``tokens``, cancelling remaining siblings on first failure."""
         if not tokens:
             return [], None
 
@@ -333,6 +580,8 @@ class WorkflowRunner:
     async def cancel(self, token: str) -> None:
         handle = self._active_runs.pop(token, None)
         if handle is None:
+            if self._task_runner is not None:
+                await self._task_runner.cancel(token)
             return
         await self._cancel_handle(handle)
 
@@ -350,12 +599,11 @@ class WorkflowRunner:
         )
 
     async def _cancel_handle(self, handle: RunHandle) -> None:
-        handle.status = RunStatus.CANCELLED
-        if handle.cf_future is not None and not handle.cf_future.done():
-            handle.cf_future.cancel()
-
-        if handle.process is not None and handle.process.returncode is None:
-            _kill_process_sync(handle.process, force=False)
+        if self._task_runner is not None:
+            if handle.is_scheduled:
+                await self._task_runner.cancel_schedule(handle.token)
+            else:
+                await self._task_runner.cancel(handle.token)
 
         if handle.task is not None and not handle.task.done():
             handle.task.cancel()
@@ -364,388 +612,59 @@ class WorkflowRunner:
             except (asyncio.CancelledError, Exception):
                 pass
 
-        if handle.process is not None and handle.process.returncode is None:
-            await _terminate_and_reap_process(handle.process)
-
-        handle.process = None
-        handle.cf_future = None
-
     async def stop(self) -> None:
         tokens = list(self._active_runs)
         if tokens:
             await self.cancel_many(tokens)
+        if self._task_runner is not None and not self._task_runner._is_shutdown:
+            await self._task_runner.stop()
 
     async def shutdown(self) -> None:
         await self.stop()
-        self._shutdown_executor(force=False)
+
+        if self._task_runner is not None:
+            runner = self._task_runner
+            self._task_runner = None
+            executor = runner._executor
+            has_running_futures = any(
+                not fut.done() for fut in list(runner._active_executor_futures)
+            )
+            await runner.shutdown()
+            if has_running_futures and isinstance(executor, ProcessPoolExecutor):
+                _kill_process_pool_workers(executor)
+
+        if self._owns_checkpoint_store and not self._closed:
+            try:
+                await _maybe_await(self._checkpoint_store.close())
+            except Exception:
+                pass
+
         self._closed = True
 
     def abort(self) -> None:
         handles = list(self._active_runs.values())
         self._active_runs.clear()
-
         for handle in handles:
-            handle.status = RunStatus.CANCELLED
-            if handle.process is not None:
-                _kill_process_sync(handle.process, force=True)
-                handle.process = None
-            if handle.cf_future is not None and not handle.cf_future.done():
-                handle.cf_future.cancel()
-                handle.cf_future = None
             if handle.task is not None and not handle.task.done():
                 handle.task.cancel()
 
-        self._shutdown_executor(force=True)
+        if self._task_runner is not None:
+            runner = self._task_runner
+            self._task_runner = None
+            executor = runner._executor
+            has_running_futures = any(
+                not fut.done() for fut in list(runner._active_executor_futures)
+            )
+            runner.abort()
+            if has_running_futures and isinstance(executor, ProcessPoolExecutor):
+                _kill_process_pool_workers(executor)
+
+        if self._owns_checkpoint_store and not self._closed:
+            try:
+                res = self._checkpoint_store.close()
+                if inspect.iscoroutine(res):
+                    res.close()
+            except Exception:
+                pass
+
         self._closed = True
-
-    def _shutdown_executor(self, *, force: bool) -> None:
-        executor = self._executor
-        if executor is None:
-            return
-
-        self._executor = None
-        self._executor_semaphore = None
-        self._semaphore_loop = None
-
-        remaining_futures = [
-            fut for fut in list(self._active_cf_futures) if not fut.done()
-        ]
-        for fut in remaining_futures:
-            fut.cancel()
-        has_running_futures = any(not fut.done() for fut in remaining_futures)
-        self._active_cf_futures.clear()
-
-        wait_for_workers = not has_running_futures
-        try:
-            executor.shutdown(wait=wait_for_workers, cancel_futures=True)
-        except Exception:
-            pass
-
-        if (force or has_running_futures) and isinstance(executor, ProcessPoolExecutor):
-            _kill_process_pool_workers(executor)
-
-    async def _execute_step(
-        self,
-        handle: RunHandle,
-        step: Step[Any],
-    ) -> StepResult:
-        if step.repeat == "NEVER":
-            return await self._execute_once(handle, step, handle.run_id)
-
-        interval = step.schedule_seconds or 0.0
-        last_result: StepResult | None = None
-
-        if step.repeat == "ALWAYS":
-            iteration = 0
-            while True:
-                run_id = (
-                    handle.run_id
-                    if iteration == 0
-                    else self._snowflake_generator.generate()
-                )
-                last_result = await self._execute_once(handle, step, run_id)
-                self._record_and_prune_history(handle, step, last_result)
-                iteration += 1
-                await asyncio.sleep(interval)
-        else:
-            total_iterations = step.repeat
-            for iteration in range(total_iterations):
-                run_id = (
-                    handle.run_id
-                    if iteration == 0
-                    else self._snowflake_generator.generate()
-                )
-                last_result = await self._execute_once(handle, step, run_id)
-                self._record_and_prune_history(handle, step, last_result)
-                if iteration + 1 < total_iterations and interval > 0:
-                    await asyncio.sleep(interval)
-
-        assert last_result is not None
-        return last_result
-
-    @staticmethod
-    def _record_and_prune_history(
-        handle: RunHandle,
-        step: Step[Any],
-        result: StepResult,
-    ) -> None:
-        handle.history.append(result)
-        policy = step.keep_policy
-
-        if policy in ("AGE", "COUNT_AND_AGE") and step.max_age_seconds is not None:
-            now = time.monotonic()
-            handle.history = [
-                item
-                for item in handle.history
-                if (now - item.start) <= step.max_age_seconds
-            ]
-
-        if policy in ("COUNT", "COUNT_AND_AGE"):
-            limit = step.keep if step.keep is not None else 10
-            if len(handle.history) > limit:
-                handle.history = handle.history[-limit:]
-
-    async def _execute_once(
-        self,
-        handle: RunHandle,
-        step: Step[Any],
-        run_id: int,
-    ) -> StepResult:
-        if step.type == StepType.SHELL:
-            return await self._execute_shell(handle, step, run_id)
-        return await self._execute_callable(handle, step, run_id)
-
-    async def _execute_shell(
-        self,
-        handle: RunHandle,
-        step: Step[Any],
-        run_id: int,
-    ) -> ShellProcess:
-        assert isinstance(step.call, str)
-        start = time.monotonic()
-        handle.start = start
-        handle.status = RunStatus.RUNNING
-        command_type: Literal["shell", "subprocess"] = (
-            "shell" if step.shell else "subprocess"
-        )
-        cwd_str = str(step.cwd) if step.cwd is not None else None
-        env_map = (
-            {str(k): str(v) for k, v in step.env.items()}
-            if step.env is not None
-            else None
-        )
-        subprocess_kwargs: dict[str, Any] = {
-            "stdout": asyncio.subprocess.PIPE,
-            "stderr": asyncio.subprocess.PIPE,
-            "env": env_map,
-            "cwd": cwd_str,
-        }
-        if _IS_POSIX:
-            subprocess_kwargs["start_new_session"] = True
-
-        try:
-            if step.shell:
-                if step.shell_args:
-                    quoted = [shlex.quote(arg) for arg in step.shell_args]
-                    full_cmd = " ".join([step.call, *quoted])
-                else:
-                    full_cmd = step.call
-
-                process = await asyncio.create_subprocess_shell(
-                    full_cmd,
-                    **subprocess_kwargs,
-                )
-            else:
-                process = await asyncio.create_subprocess_exec(
-                    step.call,
-                    *step.shell_args,
-                    **subprocess_kwargs,
-                )
-        except Exception as err:
-            end = time.monotonic()
-            handle.status = RunStatus.FAILED
-            return ShellProcess(
-                run_id=run_id,
-                task_name=step.name,
-                process_id=-1,
-                command=step.call,
-                args=step.shell_args,
-                status=RunStatus.FAILED,
-                return_code=None,
-                env=step.env,
-                working_directory=cwd_str,
-                command_type=command_type,
-                error=f"Err. - Task Run - {run_id} - encountered error {err}.",
-                trace=traceback.format_exc(),
-                start=start,
-                end=end,
-                elapsed=end - start,
-                result=None,
-                task_type=TaskType.SHELL,
-            )
-
-        handle.process = process
-        pid = process.pid if process.pid is not None else -1
-
-        try:
-            if step.timeout_seconds is not None:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=step.timeout_seconds,
-                )
-            else:
-                stdout_bytes, stderr_bytes = await process.communicate()
-
-        except asyncio.TimeoutError:
-            await _terminate_and_reap_process(process)
-            end = time.monotonic()
-            handle.status = RunStatus.FAILED
-            return ShellProcess(
-                run_id=run_id,
-                task_name=step.name,
-                process_id=pid,
-                command=step.call,
-                args=step.shell_args,
-                status=RunStatus.FAILED,
-                return_code=process.returncode,
-                env=step.env,
-                working_directory=cwd_str,
-                command_type=command_type,
-                error=(
-                    f"Err. - Task Run - {run_id} - timed out. "
-                    f"Exceeded deadline of - {step.timeout_seconds} - seconds."
-                ),
-                trace=None,
-                start=start,
-                end=end,
-                elapsed=end - start,
-                result=None,
-                task_type=TaskType.SHELL,
-            )
-
-        except asyncio.CancelledError:
-            handle.status = RunStatus.CANCELLED
-            await _terminate_and_reap_process(process)
-            raise
-
-        except Exception as err:
-            await _terminate_and_reap_process(process)
-            end = time.monotonic()
-            handle.status = RunStatus.FAILED
-            return ShellProcess(
-                run_id=run_id,
-                task_name=step.name,
-                process_id=pid,
-                command=step.call,
-                args=step.shell_args,
-                status=RunStatus.FAILED,
-                return_code=process.returncode,
-                env=step.env,
-                working_directory=cwd_str,
-                command_type=command_type,
-                error=f"Err. - Task Run - {run_id} - encountered error {err}.",
-                trace=traceback.format_exc(),
-                start=start,
-                end=end,
-                elapsed=end - start,
-                result=None,
-                task_type=TaskType.SHELL,
-            )
-
-        finally:
-            handle.process = None
-
-        end = time.monotonic()
-        stdout = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
-        stderr = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
-        return_code = process.returncode
-
-        if return_code != 0:
-            status = RunStatus.FAILED
-            error: str | None = (
-                f"Err. - Task Run - {run_id} - failed. Encountered exception - {stderr}."
-            )
-        else:
-            status = RunStatus.COMPLETE
-            error = stderr if stderr else None
-
-        handle.status = status
-        return ShellProcess(
-            run_id=run_id,
-            task_name=step.name,
-            process_id=pid,
-            command=step.call,
-            args=step.shell_args,
-            status=status,
-            return_code=return_code,
-            env=step.env,
-            working_directory=cwd_str,
-            command_type=command_type,
-            error=error,
-            result=stdout,
-            trace=None,
-            start=start,
-            end=end,
-            elapsed=end - start,
-            task_type=TaskType.SHELL,
-        )
-
-    async def _execute_callable(
-        self,
-        handle: RunHandle,
-        step: Step[Any],
-        run_id: int,
-    ) -> TaskRun:
-        start = time.monotonic()
-        handle.start = start
-        handle.status = RunStatus.RUNNING
-        result: Any = None
-        error: str | None = None
-        trace: str | None = None
-        status = RunStatus.COMPLETE
-
-        try:
-            if step.type == StepType.ASYNC or is_async_callable(step.call):
-                coro = step.call(*step.args, **step.kwargs)
-                if step.timeout_seconds is not None:
-                    result = await asyncio.wait_for(coro, timeout=step.timeout_seconds)
-                else:
-                    result = await coro
-            else:
-                loop = asyncio.get_running_loop()
-                executor, semaphore = self._ensure_executor(loop)
-                target = (
-                    functools.partial(step.call, *step.args, **step.kwargs)
-                    if (step.args or step.kwargs)
-                    else step.call
-                )
-                async with semaphore:
-                    cf_future = executor.submit(target)
-                    self._active_cf_futures.add(cf_future)
-                    cf_future.add_done_callback(self._active_cf_futures.discard)
-                    handle.cf_future = cf_future
-                    aio_future = asyncio.wrap_future(cf_future, loop=loop)
-                    try:
-                        if step.timeout_seconds is not None:
-                            result = await asyncio.wait_for(
-                                aio_future,
-                                timeout=step.timeout_seconds,
-                            )
-                        else:
-                            result = await aio_future
-                    except BaseException:
-                        cf_future.cancel()
-                        raise
-                    finally:
-                        handle.cf_future = None
-
-        except asyncio.TimeoutError:
-            error = (
-                f"Err. - Task Run - {run_id} - timed out. "
-                f"Exceeded deadline of - {step.timeout_seconds} - seconds."
-            )
-            status = RunStatus.FAILED
-
-        except asyncio.CancelledError:
-            handle.status = RunStatus.CANCELLED
-            raise
-
-        except Exception as err:
-            error = f"Err. - Task Run - {run_id} - failed. Encountered exception - {err}."
-            trace = traceback.format_exc()
-            status = RunStatus.FAILED
-
-        end = time.monotonic()
-        handle.status = status
-        return TaskRun(
-            run_id=run_id,
-            task_name=step.name,
-            status=status,
-            error=error,
-            trace=trace,
-            start=start,
-            end=end,
-            elapsed=end - start,
-            result=result,
-            task_type=TaskType.CALLABLE,
-        )

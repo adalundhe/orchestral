@@ -5,6 +5,7 @@ WorkflowStatusName = Literal[
     "COMPLETED",
     "FAILED",
     "RUNNING",
+    "PAUSED",
     "READY",
     "CANCELLED",
 ]
@@ -15,4 +16,5 @@ class WorkflowStatus(Enum):
     FAILED = "FAILED"
     READY = "READY"
     RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
     CANCELLED = "CANCELLED"
