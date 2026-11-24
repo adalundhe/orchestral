@@ -1,6 +1,7 @@
 from typing import Any, Iterator, Literal, TypeVar
 
-from .step import Step, WorkflowTask
+from .graph import build_execution_plan
+from .step import DependenciesInput, Step, WorkflowTask
 
 T = TypeVar("T")
 
@@ -23,11 +24,20 @@ class Group:
     def steps(self) -> list[Step[Any]]:
         return list(self._steps)
 
+    def build_waves(self) -> list[list[Step[Any]]]:
+        """Validate intra-group dependencies and return parallel execution waves."""
+        return build_execution_plan([self._steps]).waves
+
+    def execution_order(self) -> list[list[str]]:
+        """Return the wave-by-wave step names for this group."""
+        return build_execution_plan([self._steps]).execution_order()
+
     def add_task(
         self,
         step: WorkflowTask[T],
         *args: Any,
         alias: str | None = None,
+        dependencies: DependenciesInput = None,
         timeout: str | int | float | None = None,
         schedule: str | int | float | None = None,
         trigger: Literal["MANUAL", "ON_START"] = "MANUAL",
@@ -39,6 +49,7 @@ class Group:
     ) -> Step[T]:
         created = Step(
             step,
+            dependencies=dependencies,
             args=args,
             kwargs=kwargs,
             alias=alias,
@@ -58,6 +69,7 @@ class Group:
         step: str,
         *args: str,
         alias: str | None = None,
+        dependencies: DependenciesInput = None,
         env: dict[str, Any] | None = None,
         cwd: str | None = None,
         shell: bool = False,
@@ -76,6 +88,7 @@ class Group:
 
         created: Step[str] = Step(
             step,
+            dependencies=dependencies,
             shell_args=args,
             env=env,
             cwd=cwd,

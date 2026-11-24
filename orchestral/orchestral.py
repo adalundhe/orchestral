@@ -2,16 +2,64 @@ import asyncio
 import time
 import traceback
 from collections import defaultdict
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from taskex import Env
-from taskex.models import RunStatus
+from taskex.models import RunStatus, ShellProcess, TaskRun, TaskType
 
 from .error import OrchestralTaskFailure
+from .graph import ExecutionPlan
 from .runner import RunHandle, StepResult
+from .step import Step
+from .step_type import StepType
 from .util import parse_duration
 from .workflow import Workflow
 from .workflow_status import WorkflowStatus
+
+
+def _make_skipped_result(
+    step: Step[Any],
+    run_id: int,
+    failed_dependencies: list[str],
+) -> StepResult:
+    now = time.monotonic()
+    deps_label = ", ".join(failed_dependencies)
+    message = f"Skipped step '{step.name}' because upstream dependency failed: {deps_label}"
+
+    if step.type == StepType.SHELL:
+        assert isinstance(step.call, str)
+        return ShellProcess(
+            run_id=run_id,
+            task_name=step.name,
+            process_id=-1,
+            command=step.call,
+            args=step.shell_args,
+            status=RunStatus.CANCELLED,
+            return_code=None,
+            env=step.env,
+            working_directory=str(step.cwd) if step.cwd is not None else None,
+            command_type="shell" if step.shell else "subprocess",
+            error=message,
+            trace=None,
+            start=now,
+            end=now,
+            elapsed=0.0,
+            result=None,
+            task_type=TaskType.SHELL,
+        )
+
+    return TaskRun(
+        run_id=run_id,
+        task_name=step.name,
+        status=RunStatus.CANCELLED,
+        error=message,
+        trace=None,
+        start=now,
+        end=now,
+        elapsed=0.0,
+        result=None,
+        task_type=TaskType.CALLABLE,
+    )
 
 
 class Orchestral:
@@ -59,6 +107,10 @@ class Orchestral:
     @property
     def is_running(self) -> bool:
         return self._run_task is not None and not self._run_task.done()
+
+    def execution_order(self) -> list[list[str]]:
+        """Validate the active workflow's dependency graph and return wave-by-wave step names."""
+        return self._workflow.execution_order()
 
     def _notify_waiters(self) -> None:
         waiter = self._batch_waiter
@@ -115,10 +167,11 @@ class Orchestral:
             raise RuntimeError("Workflow is already running")
 
         timeout_seconds = parse_duration(timeout, name="timeout")
+        workflow = self._workflow
+        plan = workflow.build_plan()
 
         self._reset_run_state()
         generation = self._run_generation
-        workflow = self._workflow
         self._start = time.monotonic()
         self._execute_next = True
         workflow.status = WorkflowStatus.RUNNING
@@ -127,6 +180,7 @@ class Orchestral:
             self._execute_workflow(
                 generation=generation,
                 workflow=workflow,
+                plan=plan,
                 fail_fast=fail_fast,
                 timeout=timeout_seconds,
             )
@@ -165,6 +219,7 @@ class Orchestral:
         *,
         generation: int,
         workflow: Workflow,
+        plan: ExecutionPlan,
         fail_fast: bool = False,
         timeout: float | None = None,
     ) -> None:
@@ -174,6 +229,7 @@ class Orchestral:
                     self._run_workflow(
                         generation=generation,
                         workflow=workflow,
+                        plan=plan,
                         fail_fast=fail_fast,
                     ),
                     timeout=timeout,
@@ -182,6 +238,7 @@ class Orchestral:
                 await self._run_workflow(
                     generation=generation,
                     workflow=workflow,
+                    plan=plan,
                     fail_fast=fail_fast,
                 )
 
@@ -225,45 +282,93 @@ class Orchestral:
         *,
         generation: int,
         workflow: Workflow,
+        plan: ExecutionPlan,
         fail_fast: bool = False,
     ) -> None:
-        for group in workflow:
+        failed_step_ids: set[int] = set()
+
+        for wave in plan.waves:
             if not self._execute_next or generation != self._run_generation:
                 break
 
-            steps = group.steps
-            if not steps:
+            if not wave:
                 continue
 
             runner = workflow.runner
-            handles: list[RunHandle] = []
-            group_tokens: list[str] = []
-            try:
-                for step in steps:
-                    handle = runner.run_step(step)
-                    handles.append(handle)
-                    group_tokens.append(handle.token)
+            runnable: list[tuple[int, Step[Any]]] = []
+            results_by_pos: dict[int, StepResult] = {}
 
-                if fail_fast:
-                    group_results, failed = await runner.wait_all_fail_fast(
-                        group_tokens
+            for pos, step in enumerate(wave):
+                upstream_ids = plan.upstream_step_ids.get(id(step), ())
+                failed_upstreams = [
+                    plan.step_by_id[uid].name
+                    for uid in upstream_ids
+                    if uid in failed_step_ids
+                ]
+                if failed_upstreams:
+                    failed_step_ids.add(id(step))
+                    results_by_pos[pos] = _make_skipped_result(
+                        step,
+                        runner.create_task_id(),
+                        failed_upstreams,
                     )
                 else:
-                    group_results = await runner.wait_all(group_tokens)
-                    failed = None
-            except BaseException:
-                if group_tokens:
-                    await runner.cancel_many(group_tokens)
-                raise
+                    runnable.append((pos, step))
+
+            handles: list[tuple[int, Step[Any], RunHandle]] = []
+            wave_tokens: list[str] = []
+            failed: StepResult | None = None
+
+            if runnable:
+                try:
+                    for pos, step in runnable:
+                        handle = runner.run_step(step)
+                        handles.append((pos, step, handle))
+                        wave_tokens.append(handle.token)
+
+                    if fail_fast:
+                        runnable_results, failed = await runner.wait_all_fail_fast(
+                            wave_tokens
+                        )
+                    else:
+                        runnable_results = await runner.wait_all(wave_tokens)
+                except BaseException:
+                    if wave_tokens:
+                        await runner.cancel_many(wave_tokens)
+                    raise
+
+                if generation != self._run_generation:
+                    return
+
+                handle_by_run_id = {h.run_id: (pos, step, h) for pos, step, h in handles}
+                # Map completed results back to their wave positions; for repeating steps,
+                # the final result's run_id may differ from handle.run_id (iteration 0),
+                # so also fall back to matching by history membership.
+                for res in runnable_results:
+                    entry = handle_by_run_id.get(res.run_id)
+                    if entry is None:
+                        for pos, step, h in handles:
+                            if any(hr.run_id == res.run_id for hr in h.history):
+                                entry = (pos, step, h)
+                                break
+                    if entry is not None:
+                        pos, step, _ = entry
+                        results_by_pos[pos] = res
+                        if res.status != RunStatus.COMPLETE:
+                            failed_step_ids.add(id(step))
 
             if generation != self._run_generation:
                 return
 
-            self._batches.append(group_results)
-            for res in group_results:
+            wave_results = [
+                results_by_pos[pos] for pos in sorted(results_by_pos)
+            ]
+
+            self._batches.append(wave_results)
+            for res in wave_results:
                 self.results[res.task_name][res.run_id] = res
 
-            for handle in handles:
+            for _, _, handle in handles:
                 for hist_res in handle.history:
                     self.results[hist_res.task_name][hist_res.run_id] = hist_res
 

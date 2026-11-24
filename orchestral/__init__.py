@@ -1,4 +1,9 @@
+from .error import OrchestralCycleError as OrchestralCycleError
+from .error import OrchestralError as OrchestralError
+from .error import OrchestralGraphError as OrchestralGraphError
 from .error import OrchestralTaskFailure as OrchestralTaskFailure
+from .graph import ExecutionPlan as ExecutionPlan
+from .graph import build_execution_plan as build_execution_plan
 from .group import Group as Group
 from .orchestral import Orchestral as Orchestral
 from .runner import RunHandle as RunHandle
@@ -11,8 +16,12 @@ from .workflow_status import WorkflowStatus as WorkflowStatus
 from .workflow_status import WorkflowStatusName as WorkflowStatusName
 
 __all__ = [
+    "ExecutionPlan",
     "Group",
     "Orchestral",
+    "OrchestralCycleError",
+    "OrchestralError",
+    "OrchestralGraphError",
     "OrchestralTaskFailure",
     "RunHandle",
     "Step",
@@ -22,4 +31,5 @@ __all__ = [
     "WorkflowRunner",
     "WorkflowStatus",
     "WorkflowStatusName",
+    "build_execution_plan",
 ]

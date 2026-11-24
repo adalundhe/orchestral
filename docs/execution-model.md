@@ -1,28 +1,40 @@
 # Execution Model & Configuration
 
-## Groups and Concurrency
+## Dependency-Graph Waves and Group Barriers
 
-A `Workflow` is an ordered list of `Group`s:
+Before running a workflow, `orchestral` validates all declared dependencies and compiles the workflow into an `ExecutionPlan` of ordered **waves** using Kahn's level-by-level topological sort (`build_execution_plan`):
 
 ```
-Group 1: [ step A, step B, step C ]   <-- launched together, run concurrently
-                    |
-                    v  (all steps in Group 1 complete)
-Group 2: [ step D, step E ]           <-- launched together, run concurrently
-                    |
-                    v
-Group 3: [ step F ]
+          ┌──▶ test_unit ──┐
+build ────┤                ├──▶ deploy
+          └──▶ test_int  ──┘
+
+Wave 1: [ build ]                   <-- runs first
+Wave 2: [ test_unit, test_int ]     <-- run concurrently once Wave 1 finishes
+Wave 3: [ deploy ]                  <-- runs once Wave 2 finishes
 ```
 
-- Empty groups (groups with no steps added) are skipped automatically.
-- All steps in a group are launched together via `WorkflowRunner` and awaited concurrently.
-- Each group's completed results are recorded in `orch.results` and emitted to any `async for batch in orch:` consumers before the next group begins.
+### Rules of Wave Resolution
+
+- **Within a group (or flat `workflow.add_task` / `add_command` DAG)**:
+  - Steps with no unsatisfied dependencies start in Wave 1 and execute concurrently.
+  - Each subsequent wave contains every step whose dependencies all completed in earlier waves, preserving step declaration order within each wave.
+  - Steps may be declared in any order (a dependent step can be added before its dependency).
+  - Duplicate step names work as a fan-in when referenced by name/callable (`dependencies=[fetch]` waits for every `fetch` step), or you can depend on a single specific step by passing the `Step` object returned by `add_task` / `add_command`.
+- **Across explicit `Group`s**:
+  - `workflow.group()` creates a strict sequential stage barrier: all waves in Group `k` finish before Group `k + 1` begins.
+  - A step in Group `k` may depend on steps in the same group `k` or in any earlier group `< k`.
+  - Depending on a step defined only in a later group `> k` raises `OrchestralGraphError`.
+- **Upfront validation**:
+  - Call `workflow.execution_order()`, `workflow.build_waves()`, or `orch.execution_order()` to validate and inspect waves before execution.
+  - `await orch.run(...)` always validates the full workflow graph before launching a single step—cycles (`OrchestralCycleError`) and missing dependencies (`OrchestralGraphError`) fail immediately with zero partial execution.
+  - Empty groups are skipped automatically.
 
 ## Step Types
 
 `Step` classifies each step automatically into a `StepType`:
 
-| `StepType`       | Input to `Group`                   | Execution Mechanism                                                     | Result Model   |
+| `StepType`       | Input to `Workflow` / `Group`      | Execution Mechanism                                                     | Result Model   |
 | ---------------- | ---------------------------------- | ----------------------------------------------------------------------- | -------------- |
 | `StepType.SHELL` | `add_command(cmd: str, *args)`     | `asyncio.create_subprocess_exec` or `create_subprocess_shell`           | `ShellProcess` |
 | `StepType.ASYNC` | `add_task(async_fn, *args, **kw)`  | Awaited directly on the running asyncio event loop                      | `TaskRun`      |
@@ -66,7 +78,7 @@ Key behaviors:
 Individual steps support repetition with `schedule`, `repeat`, and history retention controls:
 
 ```python
-group.add_task(
+workflow.add_task(
     poll_health,
     alias="health_check",
     schedule="500ms",        # delay between iterations

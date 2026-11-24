@@ -1,4 +1,5 @@
 import inspect
+from collections.abc import Iterable
 from typing import (
     Any,
     Awaitable,
@@ -15,16 +16,71 @@ T = TypeVar("T")
 
 WorkflowTask = Callable[..., Awaitable[T]] | Callable[..., T]
 WorkflowStep = str | WorkflowTask[T]
+DependencySpec = WorkflowStep[Any] | "Step[Any]"
+DependenciesInput = DependencySpec | Iterable[DependencySpec] | None
 
 _VALID_TRIGGERS = ("MANUAL", "ON_START")
 _VALID_KEEP_POLICIES = ("COUNT", "AGE", "COUNT_AND_AGE")
+
+
+def _normalize_dependencies(
+    positional: tuple[DependencySpec, ...],
+    keyword: DependenciesInput,
+) -> tuple[list["Step[Any] | str"], list[str]]:
+    raw_items: list[Any] = list(positional)
+
+    if keyword is not None:
+        if isinstance(keyword, bytes):
+            raise TypeError("dependencies cannot be bytes")
+        if isinstance(keyword, (str, Step)) or callable(keyword):
+            raw_items.append(keyword)
+        elif isinstance(keyword, Iterable):
+            raw_items.extend(keyword)
+        else:
+            raise TypeError(
+                f"dependencies must be a step, name, callable, or iterable thereof, "
+                f"got {type(keyword).__name__}"
+            )
+
+    refs: list[Step[Any] | str] = []
+    names: list[str] = []
+    seen_step_ids: set[int] = set()
+    seen_names: set[str] = set()
+
+    for dep in raw_items:
+        if isinstance(dep, Step):
+            if id(dep) not in seen_step_ids:
+                seen_step_ids.add(id(dep))
+                refs.append(dep)
+                names.append(dep.name)
+        elif isinstance(dep, str):
+            if not dep.strip():
+                raise ValueError("Dependency name cannot be empty")
+            if dep not in seen_names:
+                seen_names.add(dep)
+                refs.append(dep)
+                names.append(dep)
+        elif callable(dep):
+            resolved = resolve_callable_name(dep)
+            if resolved not in seen_names:
+                seen_names.add(resolved)
+                refs.append(resolved)
+                names.append(resolved)
+        else:
+            raise TypeError(
+                f"Each dependency must be a Step, str, or callable, "
+                f"got {type(dep).__name__}"
+            )
+
+    return refs, names
 
 
 class Step(Generic[T]):
     def __init__(
         self,
         step: WorkflowStep[T],
-        *dependencies: WorkflowStep[Any],
+        *deps: DependencySpec,
+        dependencies: DependenciesInput = None,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
         shell_args: tuple[str, ...] = (),
@@ -77,7 +133,9 @@ class Step(Generic[T]):
 
         if keep is not None:
             if isinstance(keep, bool) or not isinstance(keep, int) or keep <= 0:
-                raise ValueError(f"keep must be a positive integer or None, got {keep!r}")
+                raise ValueError(
+                    f"keep must be a positive integer or None, got {keep!r}"
+                )
 
         self.timeout_seconds = parse_duration(timeout, name="timeout")
         self.schedule_seconds = parse_duration(schedule, name="schedule")
@@ -89,10 +147,13 @@ class Step(Generic[T]):
         if alias is not None and (not isinstance(alias, str) or not alias):
             raise ValueError("alias must be a non-empty string or None")
 
+        dep_refs, dep_names = _normalize_dependencies(deps, dependencies)
+
         self.call = step
         self.args = tuple(args)
         self.kwargs: dict[str, Any] = dict(kwargs) if kwargs is not None else {}
-        self.dependencies = [resolve_callable_name(dep) for dep in dependencies]
+        self._dependency_refs: tuple[Step[Any] | str, ...] = tuple(dep_refs)
+        self.dependencies: list[str] = dep_names
 
         self.alias = alias
         self.name = alias if alias is not None else resolve_callable_name(step)

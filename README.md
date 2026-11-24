@@ -1,6 +1,6 @@
 # orchestral
 
-Orchestrate and execute shell commands, async coroutines, and sync Python functions in structured, concurrent workflows.
+Orchestrate and execute shell commands, async coroutines, and sync Python functions in dependency-graph waves and sequential groups.
 
 [![PyPI version](https://img.shields.io/pypi/v/orchestral?color=blue)](https://pypi.org/project/orchestral/)
 [![License](https://img.shields.io/github/license/adalundhe/orchestral)](https://github.com/adalundhe/orchestral/blob/main/LICENSE)
@@ -8,7 +8,7 @@ Orchestrate and execute shell commands, async coroutines, and sync Python functi
 
 | Package  | orchestral                                       |
 | -------- | ------------------------------------------------ |
-| Version  | 0.2.0                                            |
+| Version  | 0.3.0                                            |
 | Download | https://pypi.org/project/orchestral/             |
 | Source   | https://github.com/adalundhe/orchestral          |
 | Keywords | async, tasks, workflow, runner, graph, shell, jobs |
@@ -16,9 +16,10 @@ Orchestrate and execute shell commands, async coroutines, and sync Python functi
 ## Features
 
 - **Unified task orchestration**: Mix shell commands (`add_command`), `async def` coroutines, and synchronous Python callables (`add_task`) in the same workflow.
-- **Sequential groups, concurrent steps**: Groups execute strictly in order; all steps inside a group execute concurrently.
-- **Streaming batch results**: Consume each group's results as it completes using `async for batch in orch:`.
-- **Fail-fast & error capture**: Run to completion by default or enable `fail_fast=True` to cancel in-flight siblings immediately and stop subsequent groups on the first failure.
+- **Dependency-graph wave execution**: Declare step `dependencies` by name/alias, callable, or `Step` reference; `orchestral` validates the DAG (detecting missing dependencies and cycles upfront) and executes topologically sorted parallel waves.
+- **Explicit sequential groups**: Organize stages with `workflow.group()` when you want strict stage barriers, with optional intra-group or cross-group dependencies.
+- **Streaming wave results**: Consume each wave's results as it completes using `async for batch in orch:`.
+- **Fail-fast & branch-aware failure handling**: Under `fail_fast=True`, failures immediately cancel in-flight siblings and halt remaining waves; under `fail_fast=False`, independent branches continue while steps with failed explicit upstream dependencies are safely skipped (`RunStatus.CANCELLED`).
 - **Timeouts at every level**: Enforce deadlines on individual steps or the entire workflow using numbers (seconds) or duration strings (`"500ms"`, `"5s"`, `"1m30s"`).
 - **Safe process & resource lifecycle**: Automatically terminates and reaps subprocesses (including child process groups on POSIX), shuts down executors cleanly, and supports `async with`, `stop()`, `shutdown()`, and `abort()`.
 - **Scheduled / repeating steps**: Repeat individual steps on an interval with bounded history retention (`COUNT`, `AGE`, or `COUNT_AND_AGE`).
@@ -39,10 +40,58 @@ uv add orchestral
 
 ## Quick Start
 
+### Dependency-graph (DAG) workflow
+
+```python
+import asyncio
+from orchestral import Orchestral
+
+
+async def build() -> str:
+    await asyncio.sleep(0.05)
+    return "artifact.whl"
+
+
+async def unit_tests() -> str:
+    await asyncio.sleep(0.05)
+    return "unit:ok"
+
+
+async def integration_tests() -> str:
+    await asyncio.sleep(0.05)
+    return "integration:ok"
+
+
+async def main() -> None:
+    async with Orchestral() as orch:
+        with orch as workflow:
+            s_build = workflow.add_task(build)
+            s_unit = workflow.add_task(unit_tests, dependencies=[s_build])
+            s_int = workflow.add_task(integration_tests, dependencies=["build"])
+            workflow.add_command(
+                "echo",
+                "deploying",
+                alias="deploy",
+                dependencies=[s_unit, s_int],
+            )
+
+        # Inspect planned parallel waves before running:
+        # [["build"], ["unit_tests", "integration_tests"], ["deploy"]]
+        print("Waves:", orch.execution_order())
+
+        await orch.run(wait=True, fail_fast=True, timeout="30s")
+        print("Status:", orch.status, f"({orch.elapsed:.3f}s)")
+
+
+asyncio.run(main())
+```
+
+### Explicit sequential groups
+
 ```python
 import asyncio
 from taskex import Env
-from orchestral import Orchestral, WorkflowStatus
+from orchestral import Orchestral
 
 
 async def fetch_greeting(name: str) -> str:
@@ -71,7 +120,6 @@ async def main() -> None:
         await orch.run(wait=True, fail_fast=True, timeout="30s")
 
         print("Status:", orch.status)
-        print("Elapsed:", f"{orch.elapsed:.3f}s")
         for task_name, runs in orch.results.items():
             for run_id, result in runs.items():
                 print(task_name, run_id, result.status, result.result)
@@ -82,22 +130,24 @@ asyncio.run(main())
 
 ## Common Patterns
 
-### Non-blocking runs & streaming batch results
+### Non-blocking runs & streaming wave results
 
 ```python
 async with Orchestral() as orch:
     with orch as workflow:
-        g1 = workflow.group()
-        g1.add_command("ls", alias="list_files")
-        g1.add_command("pwd", alias="working_dir")
-
-        g2 = workflow.group()
-        g2.add_command("echo", "done", alias="finish")
+        workflow.add_command("ls", alias="list_files")
+        workflow.add_command("pwd", alias="working_dir")
+        workflow.add_command(
+            "echo",
+            "done",
+            alias="finish",
+            dependencies=["list_files", "working_dir"],
+        )
 
     await orch.run(wait=False)
 
     async for batch in orch:
-        print("Completed group:", [(r.task_name, r.status.value) for r in batch])
+        print("Completed wave:", [(r.task_name, r.status.value) for r in batch])
 ```
 
 ### Explicit lifecycle management
@@ -108,8 +158,7 @@ If you prefer not to use `async with`, always call `await orch.shutdown()` (or s
 orch = Orchestral()
 try:
     with orch as workflow:
-        group = workflow.group()
-        group.add_command("echo", "hello")
+        workflow.add_command("echo", "hello")
     await orch.run(wait=True)
 finally:
     await orch.shutdown()
@@ -117,8 +166,9 @@ finally:
 
 ### Error handling & `fail_fast`
 
-- `fail_fast=False` (default): individual failures are recorded on their `TaskRun` / `ShellProcess` entries in `orch.results` with `status == RunStatus.FAILED`, while remaining steps and groups continue to run.
-- `fail_fast=True`: the first failed step immediately cancels remaining in-flight siblings in the current group, skips subsequent groups, records the completed results from the failing group, sets `orch.status = WorkflowStatus.FAILED`, and populates `orch.error` with an `OrchestralTaskFailure` (and `orch.trace` with the traceback).
+- **Graph validation errors**: Missing dependencies, forward references to later groups, and dependency cycles raise `OrchestralGraphError` / `OrchestralCycleError` before any step runs.
+- **`fail_fast=False` (default)**: Individual failures are recorded on their `TaskRun` / `ShellProcess` entries in `orch.results` with `status == RunStatus.FAILED`. Steps that explicitly depend on a failed upstream step are skipped (`RunStatus.CANCELLED`), while independent branches continue to run.
+- **`fail_fast=True`**: The first failed step immediately cancels remaining in-flight siblings in the current wave, skips subsequent waves, records the completed results from the failing wave, sets `orch.status = WorkflowStatus.FAILED`, and populates `orch.error` with an `OrchestralTaskFailure` (and `orch.trace` with the traceback).
 
 ### Executor configuration
 
@@ -151,6 +201,7 @@ Detailed guides and API reference live in [`docs/`](docs/index.md):
 
 Runnable examples are available in [`examples/`](examples/):
 
+- [`examples/dag_workflow.py`](examples/dag_workflow.py)
 - [`examples/shell_workflow.py`](examples/shell_workflow.py)
 - [`examples/mixed_workflow.py`](examples/mixed_workflow.py)
 
